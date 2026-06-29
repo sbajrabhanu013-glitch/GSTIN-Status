@@ -1,8 +1,7 @@
 import re
-import requests
-from bs4 import BeautifulSoup
 import pandas as pd
 import streamlit as st
+from playwright.sync_api import sync_playwright
 
 GST_PORTAL_URL = "https://services.gst.gov.in/services/searchtp"
 
@@ -14,91 +13,83 @@ def validate_gstin(gstin):
     return re.match(pattern, gstin)
 
 # -------------------------------
-# Fetch Captcha
+# Playwright Workflow
 # -------------------------------
-def fetch_captcha(session, debug=False):
-    captcha_page = session.get(GST_PORTAL_URL)
-    soup = BeautifulSoup(captcha_page.text, "html.parser")
-    captcha_img_tag = soup.find("img", {"id": "captchaImg"}) \
-                      or soup.find("img", {"class": "captcha-img"}) \
-                      or soup.find("img", {"alt": "Captcha"})
-    if captcha_img_tag and "src" in captcha_img_tag.attrs:
-        captcha_url = "https://services.gst.gov.in" + captcha_img_tag["src"]
-        return captcha_url
-    if debug:
-        # Show a snippet of HTML around where captcha should be
-        return soup.prettify()[0:1000]  # first 1000 chars for inspection
-    return None
+def gst_search(gstin, captcha_text):
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        page = browser.new_page()
+        page.goto(GST_PORTAL_URL, timeout=60000)
 
-# -------------------------------
-# Submit GSTIN + Captcha
-# -------------------------------
-def submit_search(session, gstin, captcha):
-    payload = {"gstin": gstin, "captcha": captcha}
-    response = session.post(GST_PORTAL_URL, data=payload)
-    return response.text
+        # Wait for captcha image
+        page.wait_for_selector("img#captchaImg", timeout=10000)
+        captcha_src = page.locator("img#captchaImg").get_attribute("src")
+        captcha_url = "https://services.gst.gov.in" + captcha_src
 
-# -------------------------------
-# Parse Result Page
-# -------------------------------
-def parse_result(html):
-    soup = BeautifulSoup(html, "html.parser")
-    result = {}
-    try:
-        result["Legal Name"] = soup.find("span", {"id": "legalName"}).text.strip()
-        result["Trade Name"] = soup.find("span", {"id": "tradeName"}).text.strip()
-        result["Status"] = soup.find("span", {"id": "status"}).text.strip()
-        result["Filing Frequency"] = soup.find("span", {"id": "filingFreq"}).text.strip()
+        # Fill GSTIN and captcha
+        page.fill("input#gstin", gstin)
+        page.fill("input#captcha", captcha_text)
+        page.click("button#searchBtn")
+
+        # Wait for results
+        page.wait_for_selector("span#legalName", timeout=15000)
+
+        # Extract details
+        result = {}
+        result["Legal Name"] = page.locator("span#legalName").inner_text()
+        result["Trade Name"] = page.locator("span#tradeName").inner_text()
+        result["Status"] = page.locator("span#status").inner_text()
+        result["Filing Frequency"] = page.locator("span#filingFreq").inner_text()
+
+        # Filing table
         filing_table = []
-        table = soup.find("table", {"id": "filingTable"})
-        if table:
-            for row in table.find_all("tr")[1:]:
-                cols = [col.text.strip() for col in row.find_all("td")]
-                filing_table.append(cols)
+        rows = page.locator("table#filingTable tr").all()
+        for row in rows[1:]:
+            cols = [c.inner_text().strip() for c in row.locator("td").all()]
+            filing_table.append(cols)
         result["Filing Table"] = filing_table
-    except Exception as e:
-        result["Error"] = f"Parsing failed: {e}"
-    return result
+
+        browser.close()
+        return captcha_url, result
 
 # -------------------------------
 # Streamlit UI
 # -------------------------------
-st.title("GST Taxpayer Search App")
+st.title("GST Taxpayer Search App (Playwright)")
 
 gstin = st.text_input("Enter GSTIN")
-debug_mode = st.checkbox("Enable Debug Mode (show raw HTML snippet)")
 
 if gstin:
     if validate_gstin(gstin):
         st.success("GSTIN format looks valid.")
-        session = requests.Session()
-        captcha_url = fetch_captcha(session, debug=debug_mode)
-        
-        if captcha_url and captcha_url.startswith("http"):
-            st.image(captcha_url, caption="Enter Captcha")
-            captcha = st.text_input("Captcha")
-            
-            if captcha:
-                html = submit_search(session, gstin, captcha)
-                result = parse_result(html)
-                
-                if "Error" in result:
-                    st.error(result["Error"])
-                else:
-                    st.subheader("Taxpayer Details")
-                    st.write("**Legal Name:**", result.get("Legal Name", "N/A"))
-                    st.write("**Trade Name:**", result.get("Trade Name", "N/A"))
-                    st.write("**Status:**", result.get("Status", "N/A"))
-                    st.write("**Filing Frequency:**", result.get("Filing Frequency", "N/A"))
-                    
-                    if result.get("Filing Table"):
-                        df = pd.DataFrame(result["Filing Table"], columns=["Period", "Return Type", "Status"])
-                        st.dataframe(df)
-                        st.download_button("Download as Excel", df.to_csv(index=False).encode("utf-8"), "filing_table.csv")
-                        st.download_button("Download as PDF", df.to_string().encode("utf-8"), "filing_table.pdf")
-        else:
-            st.error("Could not fetch captcha. GST portal HTML may have changed.")
-            if debug_mode and captcha_url:
-                st.text_area("Raw HTML snippet", captcha_url, height=300)
+
+        # Step 1: Show captcha
+        if st.button("Fetch Captcha"):
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                page = browser.new_page()
+                page.goto(GST_PORTAL_URL, timeout=60000)
+                page.wait_for_selector("img#captchaImg", timeout=10000)
+                captcha_src = page.locator("img#captchaImg").get_attribute("src")
+                captcha_url = "https://services.gst.gov.in" + captcha_src
+                st.image(captcha_url, caption="Enter Captcha")
+                browser.close()
+
+        captcha = st.text_input("Captcha")
+
+        if captcha and st.button("Submit Search"):
+            captcha_url, result = gst_search(gstin, captcha)
+
+            st.subheader("Taxpayer Details")
+            st.write("**Legal Name:**", result.get("Legal Name", "N/A"))
+            st.write("**Trade Name:**", result.get("Trade Name", "N/A"))
+            st.write("**Status:**", result.get("Status", "N/A"))
+            st.write("**Filing Frequency:**", result.get("Filing Frequency", "N/A"))
+
+            if result.get("Filing Table"):
+                df = pd.DataFrame(result["Filing Table"], columns=["Period", "Return Type", "Status"])
+                st.dataframe(df)
+                st.download_button("Download as Excel", df.to_csv(index=False).encode("utf-8"), "filing_table.csv")
+                st.download_button("Download as PDF", df.to_string().encode("utf-8"), "filing_table.pdf")
     else:
         st.error("Invalid GSTIN format. Please check again.")
