@@ -1,6 +1,7 @@
 import re
 from datetime import datetime
 from io import BytesIO
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
@@ -63,6 +64,7 @@ GSTIN_COLUMNS = [
     "GSTIN / UIN Status",
     "Filing Frequency",
     "Last Updated",
+    "Capture Source",
     "Notes",
 ]
 
@@ -78,9 +80,19 @@ FILING_COLUMNS = [
 ]
 
 
-# ------------------------------------------------------------
-# GSTIN validation helpers
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# Bookmarklet JS
+# -------------------------------------------------------------------
+CAPTURE_BOOKMARKLET_JS = r"""javascript:(()=>{const txt=document.body.innerText||'';const gst=(txt.match(/\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b/i)||['UNKNOWN'])[0].toUpperCase();const block='\n\n===== GST_CAPTURE_START =====\nGSTIN: '+gst+'\nCAPTURED_AT: '+new Date().toISOString()+'\nURL: '+location.href+'\n\n'+txt+'\n===== GST_CAPTURE_END =====\n';const key='CHATGPT_GST_CAPTURE_QUEUE_V1';const old=localStorage.getItem(key)||'';localStorage.setItem(key,old+block);alert('GST result captured for '+gst+'. Total saved characters: '+localStorage.getItem(key).length+'. Use the Export GST Captures bookmarklet when done.');})();"""
+
+EXPORT_BOOKMARKLET_JS = r"""javascript:(()=>{const key='CHATGPT_GST_CAPTURE_QUEUE_V1';const data=localStorage.getItem(key)||'';if(!data){alert('No GST captures found in this browser.');return;}navigator.clipboard.writeText(data).then(()=>alert('All GST captures copied. Paste them into Streamlit.')).catch(()=>{const w=open('','GST Captures');w.document.body.innerHTML='<textarea style="width:100%;height:95vh">'+data.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))+'</textarea>';});})();"""
+
+CLEAR_BOOKMARKLET_JS = r"""javascript:(()=>{localStorage.removeItem('CHATGPT_GST_CAPTURE_QUEUE_V1');alert('GST capture queue cleared.');})();"""
+
+
+# -------------------------------------------------------------------
+# GSTIN helpers
+# -------------------------------------------------------------------
 def clean_gstin(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z]", "", str(value or "")).upper()
 
@@ -124,11 +136,15 @@ def gstin_checksum_valid(gstin: str) -> bool:
     gstin = clean_gstin(gstin)
     if len(gstin) != 15:
         return False
-    expected = compute_gstin_check_digit(gstin[:14])
-    return expected == gstin[-1]
+    return compute_gstin_check_digit(gstin[:14]) == gstin[-1]
 
 
-def make_customer_row(gstin: str) -> dict:
+def find_gstin_in_text(text: str) -> str:
+    match = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b", text or "", flags=re.IGNORECASE)
+    return clean_gstin(match.group(0)) if match else ""
+
+
+def make_customer_base(gstin: str) -> dict:
     gstin = clean_gstin(gstin)
     return {
         "GSTIN": gstin,
@@ -142,13 +158,14 @@ def make_customer_row(gstin: str) -> dict:
         "GSTIN / UIN Status": "",
         "Filing Frequency": "",
         "Last Updated": "",
+        "Capture Source": "",
         "Notes": "",
     }
 
 
-# ------------------------------------------------------------
-# Parsing helpers
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# Parser helpers
+# -------------------------------------------------------------------
 def normalize_lines(text: str) -> list[str]:
     return [line.strip() for line in (text or "").splitlines() if line.strip()]
 
@@ -158,18 +175,14 @@ def find_field(text: str, labels: list[str]) -> str:
     compact = "\n".join(lines)
 
     for label in labels:
-        # Pattern: Label: Value
-        match = re.search(
-            rf"{re.escape(label)}\s*[:\-]\s*(.+)",
-            compact,
-            flags=re.IGNORECASE,
-        )
+        # Same line: Label: Value
+        match = re.search(rf"{re.escape(label)}\s*[:\-]\s*(.+)", compact, flags=re.IGNORECASE)
         if match:
             value = match.group(1).strip()
             if value:
                 return value
 
-        # Pattern:
+        # Next line:
         # Label
         # Value
         for i, line in enumerate(lines):
@@ -184,46 +197,23 @@ def parse_taxpayer_details(text: str) -> dict:
     return {
         "Legal Name of Business": find_field(
             text,
-            [
-                "Legal Name of Business",
-                "Legal Name",
-                "Legal Name of the Business",
-            ],
+            ["Legal Name of Business", "Legal Name", "Legal Name of the Business"],
         ),
         "Trade Name": find_field(
             text,
-            [
-                "Trade Name",
-                "Trade Name, if any",
-                "Trade Name of Business",
-            ],
+            ["Trade Name", "Trade Name, if any", "Trade Name of Business"],
         ),
         "Constitution of Business": find_field(
             text,
-            [
-                "Constitution of Business",
-                "Constitution",
-                "Business Constitution",
-            ],
+            ["Constitution of Business", "Constitution", "Business Constitution"],
         ),
         "GSTIN / UIN Status": find_field(
             text,
-            [
-                "GSTIN / UIN Status",
-                "GSTIN/UIN Status",
-                "GSTIN Status",
-                "Status",
-            ],
+            ["GSTIN / UIN Status", "GSTIN/UIN Status", "GSTIN Status", "Status"],
         ),
         "Filing Frequency": find_field(
             text,
-            [
-                "Filing Frequency",
-                "Return Filing Frequency",
-                "Filing Preference",
-                "Return Frequency",
-                "Frequency",
-            ],
+            ["Filing Frequency", "Return Filing Frequency", "Filing Preference", "Return Frequency", "Frequency"],
         ),
     }
 
@@ -234,7 +224,7 @@ def standardize_return_type(value: str) -> str:
     return value
 
 
-def parse_period_from_line(line: str) -> str:
+def parse_period(line: str) -> str:
     month_pattern = (
         r"\b("
         r"Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|"
@@ -249,27 +239,30 @@ def parse_period_from_line(line: str) -> str:
     if fy_match:
         return fy_match.group(1).replace(" ", "")
 
+    quarter_match = re.search(r"\b(Q[1-4])\s*[-/]?\s*(20\d{2}[-/]\d{2,4}|20\d{2})\b", line, flags=re.IGNORECASE)
+    if quarter_match:
+        return f"{quarter_match.group(1).upper()}-{quarter_match.group(2)}"
+
     return ""
 
 
-def parse_date_from_line(line: str) -> str:
-    date_match = re.search(r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b", line)
-    return date_match.group(1) if date_match else ""
+def parse_date(line: str) -> str:
+    match = re.search(r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b", line)
+    return match.group(1) if match else ""
 
 
-def parse_arn_from_line(line: str) -> str:
-    arn_match = re.search(r"\b([A-Z]{2}\d{13,20}|[A-Z0-9]{12,25})\b", line)
-    if arn_match and not re.search(r"GSTR|CMP|FILED", arn_match.group(1), flags=re.IGNORECASE):
-        return arn_match.group(1)
-    return ""
-
-
-def parse_status_from_line(line: str) -> str:
+def parse_status(line: str) -> str:
     if re.search(r"\bnot\s+filed\b|\bpending\b|\bdefault\b|\bnot\s+available\b", line, flags=re.IGNORECASE):
         return "Not Filed / Pending"
     if re.search(r"\bfiled\b|\byes\b", line, flags=re.IGNORECASE):
         return "Filed"
     return ""
+
+
+def parse_arn(line: str) -> str:
+    # ARN patterns vary. Keep this conservative to avoid capturing return type/month text.
+    match = re.search(r"\b[A-Z]{2}\d{13,20}\b", line, flags=re.IGNORECASE)
+    return match.group(0).upper() if match else ""
 
 
 def parse_filing_rows(text: str, gstin: str) -> pd.DataFrame:
@@ -289,10 +282,10 @@ def parse_filing_rows(text: str, gstin: str) -> pd.DataFrame:
             {
                 "GSTIN": clean_gstin(gstin),
                 "Return Type": standardize_return_type(return_match.group(1)),
-                "Return Period": parse_period_from_line(line),
-                "Date of Filing": parse_date_from_line(line),
-                "Status": parse_status_from_line(line),
-                "ARN": parse_arn_from_line(line),
+                "Return Period": parse_period(line),
+                "Date of Filing": parse_date(line),
+                "Status": parse_status(line),
+                "ARN": parse_arn(line),
                 "Mode": "",
                 "Raw Text": line,
             }
@@ -304,35 +297,67 @@ def parse_filing_rows(text: str, gstin: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=FILING_COLUMNS)
 
 
-# ------------------------------------------------------------
-# Import / export helpers
-# ------------------------------------------------------------
-def read_uploaded_table(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file, dtype=str)
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded_file, dtype=str)
-    raise ValueError("Please upload CSV or Excel file only.")
+def split_capture_blocks(text: str) -> list[str]:
+    text = text or ""
+    pattern = r"===== GST_CAPTURE_START =====(.*?)===== GST_CAPTURE_END ====="
+    blocks = re.findall(pattern, text, flags=re.DOTALL | re.IGNORECASE)
+
+    if blocks:
+        return [block.strip() for block in blocks if block.strip()]
+
+    # If the user pasted plain page text, treat it as one block.
+    return [text.strip()] if text.strip() else []
 
 
-def merge_customers(existing_df: pd.DataFrame, new_rows: list[dict]) -> pd.DataFrame:
-    new_df = pd.DataFrame(new_rows, columns=GSTIN_COLUMNS)
-    combined = pd.concat([existing_df, new_df], ignore_index=True)
+def parse_capture_blocks(raw_text: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    customer_rows = []
+    filing_frames = []
+
+    for block in split_capture_blocks(raw_text):
+        gstin = find_field(block, ["GSTIN"]) or find_gstin_in_text(block)
+        gstin = clean_gstin(gstin)
+
+        if not gstin:
+            continue
+
+        details = parse_taxpayer_details(block)
+        row = make_customer_base(gstin)
+        row.update(details)
+        row["Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        row["Capture Source"] = "Bookmarklet / Pasted Result"
+        customer_rows.append(row)
+
+        filing_df = parse_filing_rows(block, gstin)
+        if not filing_df.empty:
+            filing_frames.append(filing_df)
+
+    customers_df = pd.DataFrame(customer_rows, columns=GSTIN_COLUMNS)
+    filings_df = pd.concat(filing_frames, ignore_index=True) if filing_frames else pd.DataFrame(columns=FILING_COLUMNS)
+
+    return customers_df, filings_df
+
+
+def merge_customers(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    if incoming.empty:
+        return existing
+
+    combined = pd.concat([existing, incoming], ignore_index=True)
     combined["GSTIN"] = combined["GSTIN"].map(clean_gstin)
-    combined = combined.drop_duplicates(subset=["GSTIN"], keep="first")
     combined = combined[combined["GSTIN"] != ""]
-    return combined.reset_index(drop=True)
+    combined = combined.drop_duplicates(subset=["GSTIN"], keep="last")
+    return combined.reindex(columns=GSTIN_COLUMNS).reset_index(drop=True)
 
 
-def upsert_filing_rows(existing_df: pd.DataFrame, gstin: str, new_df: pd.DataFrame) -> pd.DataFrame:
-    gstin = clean_gstin(gstin)
-    other = existing_df[existing_df["GSTIN"] != gstin].copy()
-    if new_df.empty:
-        return other.reset_index(drop=True)
-    new_df = new_df.copy()
-    new_df["GSTIN"] = gstin
-    combined = pd.concat([other, new_df], ignore_index=True)
+def merge_filings(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
+    if incoming.empty:
+        return existing
+
+    combined = pd.concat([existing, incoming], ignore_index=True)
+    combined["GSTIN"] = combined["GSTIN"].map(clean_gstin)
+    combined = combined.drop_duplicates(
+        subset=["GSTIN", "Return Type", "Return Period", "Date of Filing", "Status", "ARN", "Raw Text"],
+        keep="last",
+    )
     return combined.reindex(columns=FILING_COLUMNS).reset_index(drop=True)
 
 
@@ -357,376 +382,293 @@ def make_excel(customers_df: pd.DataFrame, filings_df: pd.DataFrame) -> bytes:
     return output.getvalue()
 
 
-def sample_csv_bytes() -> bytes:
-    sample = pd.DataFrame(
-        {
-            "GSTIN": [
-                "27ABCDE1234F1Z5",
-                "07ABCDE1234F1Z2",
-            ]
-        }
-    )
-    return sample.to_csv(index=False).encode("utf-8")
+def read_uploaded_table(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(uploaded_file, dtype=str)
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(uploaded_file, dtype=str)
+    raise ValueError("Upload CSV or Excel only.")
 
 
-# ------------------------------------------------------------
+def make_rows_from_gstin_list(values: list[str]) -> pd.DataFrame:
+    rows = []
+    for value in values:
+        gstin = clean_gstin(value)
+        if gstin:
+            rows.append(make_customer_base(gstin))
+    return pd.DataFrame(rows, columns=GSTIN_COLUMNS)
+
+
+# -------------------------------------------------------------------
 # Session state
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 if "customers_df" not in st.session_state:
     st.session_state.customers_df = pd.DataFrame(columns=GSTIN_COLUMNS)
 
 if "filings_df" not in st.session_state:
     st.session_state.filings_df = pd.DataFrame(columns=FILING_COLUMNS)
 
-if "selected_gstin" not in st.session_state:
-    st.session_state.selected_gstin = ""
 
-
-# ------------------------------------------------------------
-# Streamlit UI
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# UI
+# -------------------------------------------------------------------
 st.set_page_config(
-    page_title="GSTIN Bulk Compliance Tracker",
+    page_title="GSTIN One-Click Capture Tracker",
     page_icon="🧾",
     layout="wide",
 )
 
-st.title("🧾 GSTIN Bulk Compliance Tracker")
-st.caption("No API version: validate GSTINs, speed up portal checking, parse pasted GST portal results, and export customer-wise filing reports.")
+st.title("🧾 GSTIN One-Click Capture Tracker")
+st.caption("No API version with bookmarklet helper: solve captcha on GST portal, then capture the result page in one click.")
 
 with st.sidebar:
-    st.header("Workflow")
+    st.header("Best no-API workflow")
     st.write(
-        "1. Add or upload GSTINs\n"
-        "2. Validate automatically\n"
+        "1. Install bookmarklets once\n"
+        "2. Upload or add GSTIN list\n"
         "3. Open GST portal\n"
-        "4. Complete captcha on official website\n"
-        "5. Copy visible result text\n"
-        "6. Paste here and save\n"
-        "7. Export Excel report"
+        "4. Solve captcha on GST portal\n"
+        "5. Click Capture GST Result\n"
+        "6. Repeat for GSTINs\n"
+        "7. Click Export GST Captures\n"
+        "8. Paste once into this app"
     )
     st.divider()
-    st.link_button("Open Official GST Portal", GST_PORTAL_URL)
-    st.download_button(
-        "Download GSTIN Upload Template",
-        data=sample_csv_bytes(),
-        file_name="gstin_upload_template.csv",
-        mime="text/csv",
-    )
+    st.link_button("Open GST Portal", GST_PORTAL_URL)
 
-tab_add, tab_work, tab_dashboard, tab_export = st.tabs(
-    ["1. Add GSTINs", "2. Check & Save Details", "3. Dashboard", "4. Export"]
+tab_helper, tab_add, tab_import, tab_dashboard, tab_export = st.tabs(
+    ["0. One-Click Helper", "1. GSTIN List", "2. Import Captures", "3. Dashboard", "4. Export"]
 )
 
-# ------------------------------------------------------------
-# Tab 1: Add GSTINs
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
+# Tab 0: Bookmarklet helper
+# -------------------------------------------------------------------
+with tab_helper:
+    st.subheader("One-Click Capture Helper")
+
+    st.write(
+        "This is the fastest no-API method. It does not submit captcha or search in the backend. "
+        "You use the official GST portal normally, then use these bookmarklets to capture the visible result page."
+    )
+
+    st.write("### Install these 3 bookmarklets")
+    st.write("Create browser bookmarks and paste the following code into each bookmark's URL field.")
+
+    c1, c2, c3 = st.columns(3)
+
+    with c1:
+        st.write("#### 1. Capture GST Result")
+        st.code(CAPTURE_BOOKMARKLET_JS, language="javascript")
+        st.write("Click this after one GST result page opens.")
+
+    with c2:
+        st.write("#### 2. Export GST Captures")
+        st.code(EXPORT_BOOKMARKLET_JS, language="javascript")
+        st.write("Click this after capturing all GSTINs. It copies all captures to clipboard.")
+
+    with c3:
+        st.write("#### 3. Clear GST Captures")
+        st.code(CLEAR_BOOKMARKLET_JS, language="javascript")
+        st.write("Use this before starting a fresh batch.")
+
+    st.write("### How it saves time")
+    st.markdown(
+        """
+        Instead of copying each field manually, you only do this per GSTIN:
+        - complete captcha on GST portal
+        - click **Capture GST Result**
+
+        After all GSTINs are captured, click **Export GST Captures** once and paste everything in the next tab.
+        """
+    )
+
+# -------------------------------------------------------------------
+# Tab 1: Add GSTIN list
+# -------------------------------------------------------------------
 with tab_add:
-    st.subheader("Add GSTINs")
+    st.subheader("GSTIN List")
 
-    col_single, col_bulk = st.columns(2)
+    col1, col2 = st.columns(2)
 
-    with col_single:
-        st.write("### Add Single GSTIN")
-        single_gstin = st.text_input("Enter GSTIN", placeholder="Example: 27ABCDE1234F1Z5")
+    with col1:
+        st.write("### Paste GSTINs")
+        pasted_gstins = st.text_area(
+            "Paste one GSTIN per line",
+            height=200,
+            placeholder="27ABCDE1234F1Z5\n07ABCDE1234F1Z2",
+        )
 
-        if st.button("Add GSTIN", type="primary"):
-            gstin = clean_gstin(single_gstin)
-            if not gstin:
-                st.error("Please enter GSTIN.")
-            elif not gstin_format_valid(gstin):
-                st.error("Invalid GSTIN format.")
-            else:
-                row = make_customer_row(gstin)
-                st.session_state.customers_df = merge_customers(st.session_state.customers_df, [row])
-                st.session_state.selected_gstin = gstin
-                st.success(f"Added GSTIN: {gstin}")
+        if st.button("Add Pasted GSTINs", type="primary"):
+            values = [line.strip() for line in pasted_gstins.splitlines() if line.strip()]
+            incoming = make_rows_from_gstin_list(values)
+            st.session_state.customers_df = merge_customers(st.session_state.customers_df, incoming)
+            st.success(f"Added/updated {len(incoming)} GSTIN rows.")
 
-    with col_bulk:
-        st.write("### Upload Bulk GSTIN File")
-        uploaded_file = st.file_uploader("Upload CSV or Excel", type=["csv", "xlsx", "xls"])
-
-        if uploaded_file is not None:
+    with col2:
+        st.write("### Upload CSV/Excel")
+        uploaded = st.file_uploader("Upload file with GSTIN column", type=["csv", "xlsx", "xls"])
+        if uploaded:
             try:
-                uploaded_df = read_uploaded_table(uploaded_file)
-                st.write("Preview")
-                st.dataframe(uploaded_df.head(10), use_container_width=True)
+                df = read_uploaded_table(uploaded)
+                st.dataframe(df.head(10), use_container_width=True)
+                columns = list(df.columns)
 
-                columns = list(uploaded_df.columns)
                 default_index = 0
                 for i, col in enumerate(columns):
                     if "gst" in str(col).lower():
                         default_index = i
                         break
 
-                gstin_col = st.selectbox("Select GSTIN column", columns, index=default_index)
+                gst_col = st.selectbox("Select GSTIN column", columns, index=default_index)
 
-                if st.button("Import GSTINs"):
-                    gstins = uploaded_df[gstin_col].dropna().map(clean_gstin).tolist()
-                    rows = [make_customer_row(g) for g in gstins if g]
-                    st.session_state.customers_df = merge_customers(st.session_state.customers_df, rows)
-
-                    valid_count = sum(row["Valid Format"] for row in rows)
-                    st.success(f"Imported {len(rows)} GSTIN rows. Valid format: {valid_count}.")
+                if st.button("Import Uploaded GSTINs"):
+                    incoming = make_rows_from_gstin_list(df[gst_col].dropna().astype(str).tolist())
+                    st.session_state.customers_df = merge_customers(st.session_state.customers_df, incoming)
+                    st.success(f"Imported {len(incoming)} GSTIN rows.")
             except Exception as exc:
-                st.error(f"Import failed: {exc}")
+                st.error(f"Upload failed: {exc}")
 
-    st.divider()
-    st.write("### Customer Master")
+    st.write("### Current GSTIN Master")
     if st.session_state.customers_df.empty:
         st.info("No GSTINs added yet.")
     else:
-        edited_customers = st.data_editor(
+        edited = st.data_editor(
             st.session_state.customers_df,
             use_container_width=True,
             num_rows="dynamic",
             disabled=["State", "PAN", "Valid Format", "Checksum Valid"],
         )
 
-        if st.button("Save Customer Master Edits"):
-            edited_customers = edited_customers.copy()
-            edited_customers["GSTIN"] = edited_customers["GSTIN"].map(clean_gstin)
-            edited_customers["State"] = edited_customers["GSTIN"].map(gstin_state)
-            edited_customers["PAN"] = edited_customers["GSTIN"].map(pan_from_gstin)
-            edited_customers["Valid Format"] = edited_customers["GSTIN"].map(gstin_format_valid)
-            edited_customers["Checksum Valid"] = edited_customers["GSTIN"].map(
-                lambda x: gstin_checksum_valid(x) if gstin_format_valid(x) else False
-            )
-            st.session_state.customers_df = edited_customers.drop_duplicates(subset=["GSTIN"], keep="first").reset_index(drop=True)
-            st.success("Customer master updated.")
+        if st.button("Save GSTIN Master Edits"):
+            edited = edited.copy()
+            edited["GSTIN"] = edited["GSTIN"].map(clean_gstin)
+            edited["State"] = edited["GSTIN"].map(gstin_state)
+            edited["PAN"] = edited["GSTIN"].map(pan_from_gstin)
+            edited["Valid Format"] = edited["GSTIN"].map(gstin_format_valid)
+            edited["Checksum Valid"] = edited["GSTIN"].map(lambda x: gstin_checksum_valid(x) if gstin_format_valid(x) else False)
+            st.session_state.customers_df = edited.drop_duplicates(subset=["GSTIN"], keep="last").reset_index(drop=True)
+            st.success("GSTIN master saved.")
 
-# ------------------------------------------------------------
-# Tab 2: Check and Save Details
-# ------------------------------------------------------------
-with tab_work:
-    st.subheader("Check GSTIN and Save Taxpayer Details")
+# -------------------------------------------------------------------
+# Tab 2: Import captures
+# -------------------------------------------------------------------
+with tab_import:
+    st.subheader("Import Captured GST Results")
 
-    if st.session_state.customers_df.empty:
-        st.info("Add GSTINs first.")
-    else:
-        gstin_options = st.session_state.customers_df["GSTIN"].tolist()
-        selected_index = 0
-        if st.session_state.selected_gstin in gstin_options:
-            selected_index = gstin_options.index(st.session_state.selected_gstin)
+    st.write(
+        "After using **Export GST Captures**, paste the copied text below. "
+        "The app will read all captured blocks together."
+    )
 
-        selected_gstin = st.selectbox("Select GSTIN to work on", gstin_options, index=selected_index)
-        st.session_state.selected_gstin = selected_gstin
+    raw_capture = st.text_area(
+        "Paste exported GST captures here",
+        height=360,
+        placeholder="===== GST_CAPTURE_START =====\nGSTIN: ...\n...\n===== GST_CAPTURE_END =====",
+    )
 
-        selected_row = st.session_state.customers_df[
-            st.session_state.customers_df["GSTIN"] == selected_gstin
-        ].iloc[0].to_dict()
+    parsed_customers, parsed_filings = parse_capture_blocks(raw_capture)
 
-        status_col1, status_col2, status_col3, status_col4 = st.columns(4)
-        status_col1.metric("GSTIN", selected_gstin)
-        status_col2.metric("State", selected_row.get("State", ""))
-        status_col3.metric("PAN", selected_row.get("PAN", ""))
-        status_col4.metric("Format Valid", "Yes" if selected_row.get("Valid Format") else "No")
+    if raw_capture:
+        st.write("### Parsed Preview")
+        pc1, pc2 = st.columns(2)
+        pc1.metric("Parsed Customers", len(parsed_customers))
+        pc2.metric("Parsed Filing Rows", len(parsed_filings))
 
-        st.link_button("Open GST Portal for this GSTIN", GST_PORTAL_URL)
-
-        st.write("### Paste GST Portal Result Text")
-        st.info("On the official GST portal, enter GSTIN and captcha, copy the visible taxpayer details and filing table, then paste it below.")
-
-        pasted_text = st.text_area(
-            "Paste result text",
-            height=280,
-            placeholder=(
-                "Example:\n"
-                "Legal Name of Business: ABC PRIVATE LIMITED\n"
-                "Trade Name: ABC TRADERS\n"
-                "Constitution of Business: Private Limited Company\n"
-                "GSTIN / UIN Status: Active\n"
-                "Filing Frequency: Monthly\n"
-                "GSTR-1 Mar-2024 11/04/2024 Filed\n"
-                "GSTR-3B Mar-2024 20/04/2024 Filed"
-            ),
-        )
-
-        parsed_details = parse_taxpayer_details(pasted_text)
-        parsed_filings = parse_filing_rows(pasted_text, selected_gstin)
-
-        st.write("### Taxpayer Details")
-        form_col1, form_col2 = st.columns(2)
-
-        with form_col1:
-            legal_name = st.text_input(
-                "Legal Name of Business",
-                value=parsed_details.get("Legal Name of Business") or selected_row.get("Legal Name of Business", ""),
-            )
-            trade_name = st.text_input(
-                "Trade Name",
-                value=parsed_details.get("Trade Name") or selected_row.get("Trade Name", ""),
-            )
-            constitution = st.text_input(
-                "Constitution of Business",
-                value=parsed_details.get("Constitution of Business") or selected_row.get("Constitution of Business", ""),
-            )
-
-        with form_col2:
-            gst_status = st.text_input(
-                "GSTIN / UIN Status",
-                value=parsed_details.get("GSTIN / UIN Status") or selected_row.get("GSTIN / UIN Status", ""),
-            )
-            filing_frequency = st.text_input(
-                "Filing Frequency",
-                value=parsed_details.get("Filing Frequency") or selected_row.get("Filing Frequency", ""),
-            )
-            notes = st.text_input("Notes", value=selected_row.get("Notes", ""))
-
-        st.write("### Filing Table")
-        existing_filings = st.session_state.filings_df[
-            st.session_state.filings_df["GSTIN"] == selected_gstin
-        ]
+        if not parsed_customers.empty:
+            st.write("#### Customer Details Found")
+            st.dataframe(parsed_customers, use_container_width=True)
 
         if not parsed_filings.empty:
-            default_filings = parsed_filings
-            st.success(f"Detected {len(parsed_filings)} filing rows from pasted text.")
-        elif not existing_filings.empty:
-            default_filings = existing_filings
-        else:
-            default_filings = pd.DataFrame(
-                [
-                    {
-                        "GSTIN": selected_gstin,
-                        "Return Type": "",
-                        "Return Period": "",
-                        "Date of Filing": "",
-                        "Status": "",
-                        "ARN": "",
-                        "Mode": "",
-                        "Raw Text": "",
-                    }
-                ],
-                columns=FILING_COLUMNS,
-            )
+            st.write("#### Filing Rows Found")
+            st.dataframe(parsed_filings, use_container_width=True)
 
-        edited_filings = st.data_editor(
-            default_filings,
-            use_container_width=True,
-            num_rows="dynamic",
-            column_order=FILING_COLUMNS,
-            disabled=["GSTIN"],
-        )
+        if st.button("Save Parsed Captures", type="primary"):
+            st.session_state.customers_df = merge_customers(st.session_state.customers_df, parsed_customers)
+            st.session_state.filings_df = merge_filings(st.session_state.filings_df, parsed_filings)
+            st.success(f"Saved {len(parsed_customers)} customers and {len(parsed_filings)} filing rows.")
 
-        if st.button("Save Details for Selected GSTIN", type="primary"):
-            idx = st.session_state.customers_df["GSTIN"] == selected_gstin
-            st.session_state.customers_df.loc[idx, "Legal Name of Business"] = legal_name
-            st.session_state.customers_df.loc[idx, "Trade Name"] = trade_name
-            st.session_state.customers_df.loc[idx, "Constitution of Business"] = constitution
-            st.session_state.customers_df.loc[idx, "GSTIN / UIN Status"] = gst_status
-            st.session_state.customers_df.loc[idx, "Filing Frequency"] = filing_frequency
-            st.session_state.customers_df.loc[idx, "Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-            st.session_state.customers_df.loc[idx, "Notes"] = notes
-
-            cleaned_filings = edited_filings.copy()
-            cleaned_filings["GSTIN"] = selected_gstin
-            cleaned_filings = cleaned_filings.fillna("")
-            cleaned_filings = cleaned_filings[
-                cleaned_filings[["Return Type", "Return Period", "Date of Filing", "Status", "ARN", "Raw Text"]]
-                .astype(str)
-                .agg("".join, axis=1)
-                .str.strip()
-                != ""
-            ]
-
-            st.session_state.filings_df = upsert_filing_rows(
-                st.session_state.filings_df,
-                selected_gstin,
-                cleaned_filings,
-            )
-
-            st.success(f"Saved details for {selected_gstin}.")
-
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 # Tab 3: Dashboard
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 with tab_dashboard:
     st.subheader("Dashboard")
 
-    customers_df = st.session_state.customers_df
-    filings_df = st.session_state.filings_df
+    customers = st.session_state.customers_df
+    filings = st.session_state.filings_df
 
-    if customers_df.empty:
-        st.info("No data available yet.")
+    if customers.empty:
+        st.info("No data yet.")
     else:
-        total = len(customers_df)
-        valid = int(customers_df["Valid Format"].sum())
-        checksum_valid = int(customers_df["Checksum Valid"].sum())
-        active = int(customers_df["GSTIN / UIN Status"].str.contains("active", case=False, na=False).sum())
-        filing_rows = len(filings_df)
+        total = len(customers)
+        valid = int(customers["Valid Format"].sum())
+        checksum = int(customers["Checksum Valid"].sum())
+        active = int(customers["GSTIN / UIN Status"].str.contains("active", case=False, na=False).sum())
+        filing_rows = len(filings)
 
         m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("Total GSTINs", total)
         m2.metric("Valid Format", valid)
-        m3.metric("Checksum Valid", checksum_valid)
+        m3.metric("Checksum Valid", checksum)
         m4.metric("Active", active)
         m5.metric("Filing Rows", filing_rows)
 
-        st.write("### Status Summary")
-        if "GSTIN / UIN Status" in customers_df.columns:
-            status_summary = (
-                customers_df["GSTIN / UIN Status"]
-                .replace("", "Blank")
-                .fillna("Blank")
-                .value_counts()
-                .reset_index()
-            )
-            status_summary.columns = ["Status", "Count"]
-            st.dataframe(status_summary, use_container_width=True)
-
-        st.write("### Filing Summary")
-        if not filings_df.empty:
-            filing_summary = (
-                filings_df.groupby(["GSTIN", "Return Type", "Status"], dropna=False)
-                .size()
-                .reset_index(name="Count")
-                .sort_values(["GSTIN", "Return Type"])
-            )
-            st.dataframe(filing_summary, use_container_width=True)
-        else:
-            st.info("No filing rows saved yet.")
-
         st.write("### Customer Master")
-        st.dataframe(customers_df, use_container_width=True)
+        edited_customers = st.data_editor(customers, use_container_width=True, num_rows="dynamic")
+        if st.button("Save Customer Dashboard Edits"):
+            st.session_state.customers_df = edited_customers.reindex(columns=GSTIN_COLUMNS)
+            st.success("Customer changes saved.")
 
         st.write("### Filing Details")
-        st.dataframe(filings_df, use_container_width=True)
+        edited_filings = st.data_editor(filings, use_container_width=True, num_rows="dynamic")
+        if st.button("Save Filing Dashboard Edits"):
+            st.session_state.filings_df = edited_filings.reindex(columns=FILING_COLUMNS)
+            st.success("Filing changes saved.")
 
-# ------------------------------------------------------------
+        st.write("### Status Summary")
+        status_summary = customers["GSTIN / UIN Status"].replace("", "Blank").fillna("Blank").value_counts().reset_index()
+        status_summary.columns = ["Status", "Count"]
+        st.dataframe(status_summary, use_container_width=True)
+
+        if not filings.empty:
+            st.write("### Return Type Summary")
+            return_summary = filings["Return Type"].replace("", "Blank").fillna("Blank").value_counts().reset_index()
+            return_summary.columns = ["Return Type", "Count"]
+            st.dataframe(return_summary, use_container_width=True)
+
+# -------------------------------------------------------------------
 # Tab 4: Export
-# ------------------------------------------------------------
+# -------------------------------------------------------------------
 with tab_export:
-    st.subheader("Export Reports")
+    st.subheader("Export")
 
-    customers_df = st.session_state.customers_df
-    filings_df = st.session_state.filings_df
+    customers = st.session_state.customers_df
+    filings = st.session_state.filings_df
 
-    if customers_df.empty:
-        st.info("No data to export yet.")
+    if customers.empty:
+        st.info("Nothing to export yet.")
     else:
-        excel_bytes = make_excel(customers_df, filings_df)
+        excel_bytes = make_excel(customers, filings)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M")
 
         st.download_button(
             "Download Full Excel Report",
             data=excel_bytes,
-            file_name=f"gstin_compliance_report_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            file_name=f"gstin_one_click_report_{stamp}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
         )
 
         st.download_button(
             "Download Customer Master CSV",
-            data=customers_df.to_csv(index=False).encode("utf-8"),
-            file_name="customer_master.csv",
+            data=customers.to_csv(index=False).encode("utf-8"),
+            file_name=f"customer_master_{stamp}.csv",
             mime="text/csv",
         )
 
         st.download_button(
             "Download Filing Details CSV",
-            data=filings_df.to_csv(index=False).encode("utf-8"),
-            file_name="filing_details.csv",
+            data=filings.to_csv(index=False).encode("utf-8"),
+            file_name=f"filing_details_{stamp}.csv",
             mime="text/csv",
         )
-
-        st.write("### Export Preview")
-        st.dataframe(customers_df, use_container_width=True)
