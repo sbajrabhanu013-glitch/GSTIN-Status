@@ -1,13 +1,30 @@
+import os
 import re
+import time
 from datetime import datetime
 from io import BytesIO
-from urllib.parse import quote
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 import streamlit as st
+from dotenv import load_dotenv
 
 
-GST_PORTAL_URL = "https://services.gst.gov.in/services/searchtp"
+load_dotenv()
+
+# ============================================================
+# App Config
+# ============================================================
+PROD_BASE_URL = "https://api.sandbox.co.in"
+TEST_BASE_URL = "https://test-api.sandbox.co.in"
+
+AUTH_ENDPOINT = "/authenticate"
+SEARCH_GSTIN_ENDPOINT = "/gst/compliance/public/gstin/search"
+TRACK_GSTR_ENDPOINT = "/gst/compliance/public/gstrs/track"
+PREFERENCE_ENDPOINT = "/gst/compliance/public/gstrs/preference"
+
+DEFAULT_TIMEOUT = 45
 
 STATE_CODES = {
     "01": "Jammu & Kashmir",
@@ -52,20 +69,30 @@ STATE_CODES = {
     "99": "Centre Jurisdiction",
 }
 
-GSTIN_COLUMNS = [
+CUSTOMER_COLUMNS = [
     "GSTIN",
-    "State",
-    "PAN",
     "Valid Format",
     "Checksum Valid",
+    "State From GSTIN",
+    "PAN From GSTIN",
     "Legal Name of Business",
     "Trade Name",
     "Constitution of Business",
     "GSTIN / UIN Status",
+    "Taxpayer Type",
+    "Registration Date",
+    "Cancellation Date",
+    "Last Updated on GSTN",
+    "E-Invoice Status",
+    "Nature of Business",
+    "Principal Place State",
+    "Principal Place City",
+    "Principal Place Pincode",
     "Filing Frequency",
-    "Last Updated",
-    "Capture Source",
-    "Notes",
+    "Preference Detail",
+    "API Status",
+    "API Message",
+    "Fetched At",
 ]
 
 FILING_COLUMNS = [
@@ -75,24 +102,23 @@ FILING_COLUMNS = [
     "Date of Filing",
     "Status",
     "ARN",
-    "Mode",
-    "Raw Text",
+    "Mode of Filing",
+    "Valid",
+    "Financial Year",
+]
+
+ERROR_COLUMNS = [
+    "GSTIN",
+    "Step",
+    "Error",
+    "Raw Response",
+    "Fetched At",
 ]
 
 
-# -------------------------------------------------------------------
-# Bookmarklet JS
-# -------------------------------------------------------------------
-CAPTURE_BOOKMARKLET_JS = r"""javascript:(()=>{const txt=document.body.innerText||'';const gst=(txt.match(/\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b/i)||['UNKNOWN'])[0].toUpperCase();const block='\n\n===== GST_CAPTURE_START =====\nGSTIN: '+gst+'\nCAPTURED_AT: '+new Date().toISOString()+'\nURL: '+location.href+'\n\n'+txt+'\n===== GST_CAPTURE_END =====\n';const key='CHATGPT_GST_CAPTURE_QUEUE_V1';const old=localStorage.getItem(key)||'';localStorage.setItem(key,old+block);alert('GST result captured for '+gst+'. Total saved characters: '+localStorage.getItem(key).length+'. Use the Export GST Captures bookmarklet when done.');})();"""
-
-EXPORT_BOOKMARKLET_JS = r"""javascript:(()=>{const key='CHATGPT_GST_CAPTURE_QUEUE_V1';const data=localStorage.getItem(key)||'';if(!data){alert('No GST captures found in this browser.');return;}navigator.clipboard.writeText(data).then(()=>alert('All GST captures copied. Paste them into Streamlit.')).catch(()=>{const w=open('','GST Captures');w.document.body.innerHTML='<textarea style="width:100%;height:95vh">'+data.replace(/[&<>]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[m]))+'</textarea>';});})();"""
-
-CLEAR_BOOKMARKLET_JS = r"""javascript:(()=>{localStorage.removeItem('CHATGPT_GST_CAPTURE_QUEUE_V1');alert('GST capture queue cleared.');})();"""
-
-
-# -------------------------------------------------------------------
-# GSTIN helpers
-# -------------------------------------------------------------------
+# ============================================================
+# GSTIN Validation
+# ============================================================
 def clean_gstin(value: str) -> str:
     return re.sub(r"[^0-9A-Za-z]", "", str(value or "")).upper()
 
@@ -101,16 +127,6 @@ def gstin_format_valid(gstin: str) -> bool:
     gstin = clean_gstin(gstin)
     pattern = r"^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z][1-9A-Z]Z[0-9A-Z]$"
     return bool(re.match(pattern, gstin))
-
-
-def gstin_state(gstin: str) -> str:
-    gstin = clean_gstin(gstin)
-    return STATE_CODES.get(gstin[:2], "Unknown State Code")
-
-
-def pan_from_gstin(gstin: str) -> str:
-    gstin = clean_gstin(gstin)
-    return gstin[2:12] if len(gstin) >= 12 else ""
 
 
 def compute_gstin_check_digit(first_14_chars: str) -> str:
@@ -139,536 +155,599 @@ def gstin_checksum_valid(gstin: str) -> bool:
     return compute_gstin_check_digit(gstin[:14]) == gstin[-1]
 
 
-def find_gstin_in_text(text: str) -> str:
-    match = re.search(r"\b\d{2}[A-Z]{5}\d{4}[A-Z][1-9A-Z]Z[0-9A-Z]\b", text or "", flags=re.IGNORECASE)
-    return clean_gstin(match.group(0)) if match else ""
-
-
-def make_customer_base(gstin: str) -> dict:
+def gstin_state(gstin: str) -> str:
     gstin = clean_gstin(gstin)
-    return {
-        "GSTIN": gstin,
-        "State": gstin_state(gstin),
-        "PAN": pan_from_gstin(gstin),
-        "Valid Format": gstin_format_valid(gstin),
-        "Checksum Valid": gstin_checksum_valid(gstin) if gstin_format_valid(gstin) else False,
-        "Legal Name of Business": "",
-        "Trade Name": "",
-        "Constitution of Business": "",
-        "GSTIN / UIN Status": "",
-        "Filing Frequency": "",
-        "Last Updated": "",
-        "Capture Source": "",
-        "Notes": "",
+    return STATE_CODES.get(gstin[:2], "Unknown State Code")
+
+
+def pan_from_gstin(gstin: str) -> str:
+    gstin = clean_gstin(gstin)
+    return gstin[2:12] if len(gstin) >= 12 else ""
+
+
+# ============================================================
+# API Helpers
+# ============================================================
+def get_base_url(env: str) -> str:
+    return PROD_BASE_URL if env.lower() == "production" else TEST_BASE_URL
+
+
+def get_nested(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
+    current: Any = data
+    for key in keys:
+        if not isinstance(current, dict):
+            return default
+        current = current.get(key)
+    return current if current is not None else default
+
+
+def make_headers(api_key: str, token: str, accept_cache: bool = True) -> Dict[str, str]:
+    headers = {
+        "x-api-key": api_key,
+        "authorization": token,
+        "x-api-version": "1.0.0",
+        "Content-Type": "application/json",
+    }
+    if accept_cache:
+        headers["x-accept-cache"] = "true"
+    return headers
+
+
+def authenticate(api_key: str, api_secret: str, base_url: str) -> str:
+    url = f"{base_url}{AUTH_ENDPOINT}"
+    headers = {
+        "x-api-key": api_key,
+        "x-api-secret": api_secret,
+        "x-api-version": "1.0.0",
+        "Content-Type": "application/json",
     }
 
+    response = requests.post(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+    try:
+        payload = response.json()
+    except Exception:
+        response.raise_for_status()
+        raise RuntimeError("Authentication response was not valid JSON.")
 
-# -------------------------------------------------------------------
-# Parser helpers
-# -------------------------------------------------------------------
-def normalize_lines(text: str) -> list[str]:
-    return [line.strip() for line in (text or "").splitlines() if line.strip()]
+    if response.status_code >= 400:
+        raise RuntimeError(f"Authentication failed: {payload}")
 
+    token = get_nested(payload, "data", "access_token")
+    if not token:
+        raise RuntimeError(f"Authentication succeeded but access_token was not found: {payload}")
 
-def find_field(text: str, labels: list[str]) -> str:
-    lines = normalize_lines(text)
-    compact = "\n".join(lines)
-
-    for label in labels:
-        # Same line: Label: Value
-        match = re.search(rf"{re.escape(label)}\s*[:\-]\s*(.+)", compact, flags=re.IGNORECASE)
-        if match:
-            value = match.group(1).strip()
-            if value:
-                return value
-
-        # Next line:
-        # Label
-        # Value
-        for i, line in enumerate(lines):
-            clean_line = line.strip().strip(":").strip()
-            if clean_line.lower() == label.lower() and i + 1 < len(lines):
-                return lines[i + 1].strip()
-
-    return ""
+    return token
 
 
-def parse_taxpayer_details(text: str) -> dict:
-    return {
-        "Legal Name of Business": find_field(
-            text,
-            ["Legal Name of Business", "Legal Name", "Legal Name of the Business"],
-        ),
-        "Trade Name": find_field(
-            text,
-            ["Trade Name", "Trade Name, if any", "Trade Name of Business"],
-        ),
-        "Constitution of Business": find_field(
-            text,
-            ["Constitution of Business", "Constitution", "Business Constitution"],
-        ),
-        "GSTIN / UIN Status": find_field(
-            text,
-            ["GSTIN / UIN Status", "GSTIN/UIN Status", "GSTIN Status", "Status"],
-        ),
-        "Filing Frequency": find_field(
-            text,
-            ["Filing Frequency", "Return Filing Frequency", "Filing Preference", "Return Frequency", "Frequency"],
-        ),
-    }
-
-
-def standardize_return_type(value: str) -> str:
-    value = (value or "").upper().replace(" ", "")
-    value = value.replace("GSTR", "GSTR-").replace("CMP", "CMP-").replace("--", "-")
-    return value
-
-
-def parse_period(line: str) -> str:
-    month_pattern = (
-        r"\b("
-        r"Jan|January|Feb|February|Mar|March|Apr|April|May|Jun|June|Jul|July|"
-        r"Aug|August|Sep|Sept|September|Oct|October|Nov|November|Dec|December"
-        r")[-\s']*(\d{2,4})\b"
+def post_api(
+    base_url: str,
+    endpoint: str,
+    api_key: str,
+    token: str,
+    body: Dict[str, Any],
+    params: Optional[Dict[str, Any]] = None,
+    accept_cache: bool = True,
+) -> Dict[str, Any]:
+    url = f"{base_url}{endpoint}"
+    response = requests.post(
+        url,
+        headers=make_headers(api_key, token, accept_cache=accept_cache),
+        json=body,
+        params=params or {},
+        timeout=DEFAULT_TIMEOUT,
     )
-    month_match = re.search(month_pattern, line, flags=re.IGNORECASE)
-    if month_match:
-        return f"{month_match.group(1)[:3].title()}-{month_match.group(2)}"
 
-    fy_match = re.search(r"\b(20\d{2}\s*[-/]\s*\d{2,4})\b", line)
-    if fy_match:
-        return fy_match.group(1).replace(" ", "")
+    try:
+        payload = response.json()
+    except Exception:
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+        raise RuntimeError(f"Invalid JSON response: {response.text[:500]}")
 
-    quarter_match = re.search(r"\b(Q[1-4])\s*[-/]?\s*(20\d{2}[-/]\d{2,4}|20\d{2})\b", line, flags=re.IGNORECASE)
-    if quarter_match:
-        return f"{quarter_match.group(1).upper()}-{quarter_match.group(2)}"
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {payload}")
 
-    return ""
-
-
-def parse_date(line: str) -> str:
-    match = re.search(r"\b(\d{1,2}[-/]\d{1,2}[-/]\d{2,4})\b", line)
-    return match.group(1) if match else ""
+    return payload
 
 
-def parse_status(line: str) -> str:
-    if re.search(r"\bnot\s+filed\b|\bpending\b|\bdefault\b|\bnot\s+available\b", line, flags=re.IGNORECASE):
-        return "Not Filed / Pending"
-    if re.search(r"\bfiled\b|\byes\b", line, flags=re.IGNORECASE):
-        return "Filed"
-    return ""
+def extract_business_data(search_payload: Dict[str, Any]) -> Dict[str, Any]:
+    # Sandbox responses normally nest actual taxpayer data here:
+    # response["data"]["data"]
+    data = get_nested(search_payload, "data", "data", default={})
+    if not isinstance(data, dict):
+        data = {}
+
+    addr = get_nested(data, "pradr", "addr", default={})
+    if not isinstance(addr, dict):
+        addr = {}
+
+    nba = data.get("nba", [])
+    if isinstance(nba, list):
+        nature_of_business = ", ".join([str(x) for x in nba])
+    else:
+        nature_of_business = str(nba or "")
+
+    return {
+        "Legal Name of Business": data.get("lgnm", ""),
+        "Trade Name": data.get("tradeNam", ""),
+        "Constitution of Business": data.get("ctb", ""),
+        "GSTIN / UIN Status": data.get("sts", ""),
+        "Taxpayer Type": data.get("dty", ""),
+        "Registration Date": data.get("rgdt", ""),
+        "Cancellation Date": data.get("cxdt", ""),
+        "Last Updated on GSTN": data.get("lstupdt", ""),
+        "E-Invoice Status": data.get("einvoiceStatus", ""),
+        "Nature of Business": nature_of_business,
+        "Principal Place State": addr.get("stcd", ""),
+        "Principal Place City": addr.get("loc", "") or addr.get("dst", ""),
+        "Principal Place Pincode": addr.get("pncd", ""),
+    }
 
 
-def parse_arn(line: str) -> str:
-    # ARN patterns vary. Keep this conservative to avoid capturing return type/month text.
-    match = re.search(r"\b[A-Z]{2}\d{13,20}\b", line, flags=re.IGNORECASE)
-    return match.group(0).upper() if match else ""
+def extract_preference(preference_payload: Dict[str, Any]) -> Tuple[str, str]:
+    response = get_nested(preference_payload, "data", "data", "response", default=[])
+    if not isinstance(response, list):
+        return "", ""
 
-
-def parse_filing_rows(text: str, gstin: str) -> pd.DataFrame:
-    rows = []
-    return_pattern = r"\b(GSTR-?1|GSTR-?3B|GSTR-?4|GSTR-?9C|GSTR-?9|CMP-?08|IFF)\b"
-
-    for raw_line in (text or "").splitlines():
-        line = " ".join(str(raw_line).split())
-        if not line:
+    parts = []
+    prefs = []
+    for item in response:
+        if not isinstance(item, dict):
             continue
+        quarter = item.get("quarter", "")
+        pref = item.get("preference", "")
+        readable = {"M": "Monthly", "Q": "Quarterly"}.get(str(pref).upper(), str(pref))
+        if readable:
+            prefs.append(readable)
+        if quarter or readable:
+            parts.append(f"{quarter}: {readable}".strip(": "))
 
-        return_match = re.search(return_pattern, line, flags=re.IGNORECASE)
-        if not return_match:
+    if not parts:
+        return "", ""
+
+    unique = sorted(set(prefs))
+    frequency = unique[0] if len(unique) == 1 else "Mixed"
+    return frequency, "; ".join(parts)
+
+
+def extract_filing_rows(track_payload: Dict[str, Any], gstin: str, financial_year: str) -> List[Dict[str, Any]]:
+    rows = []
+    filed_list = get_nested(track_payload, "data", "data", "EFiledlist", default=[])
+
+    if not isinstance(filed_list, list):
+        return rows
+
+    for item in filed_list:
+        if not isinstance(item, dict):
             continue
 
         rows.append(
             {
-                "GSTIN": clean_gstin(gstin),
-                "Return Type": standardize_return_type(return_match.group(1)),
-                "Return Period": parse_period(line),
-                "Date of Filing": parse_date(line),
-                "Status": parse_status(line),
-                "ARN": parse_arn(line),
-                "Mode": "",
-                "Raw Text": line,
+                "GSTIN": gstin,
+                "Return Type": item.get("rtntype", ""),
+                "Return Period": item.get("ret_prd", ""),
+                "Date of Filing": item.get("dof", ""),
+                "Status": item.get("status", ""),
+                "ARN": item.get("arn", ""),
+                "Mode of Filing": item.get("mof", ""),
+                "Valid": item.get("valid", ""),
+                "Financial Year": financial_year,
             }
         )
 
-    if not rows:
-        return pd.DataFrame(columns=FILING_COLUMNS)
-
-    return pd.DataFrame(rows, columns=FILING_COLUMNS)
+    return rows
 
 
-def split_capture_blocks(text: str) -> list[str]:
-    text = text or ""
-    pattern = r"===== GST_CAPTURE_START =====(.*?)===== GST_CAPTURE_END ====="
-    blocks = re.findall(pattern, text, flags=re.DOTALL | re.IGNORECASE)
-
-    if blocks:
-        return [block.strip() for block in blocks if block.strip()]
-
-    # If the user pasted plain page text, treat it as one block.
-    return [text.strip()] if text.strip() else []
+def build_error(gstin: str, step: str, error: str, raw_response: Any = "") -> Dict[str, Any]:
+    return {
+        "GSTIN": gstin,
+        "Step": step,
+        "Error": error,
+        "Raw Response": str(raw_response)[:2000],
+        "Fetched At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
 
 
-def parse_capture_blocks(raw_text: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-    customer_rows = []
-    filing_frames = []
+def fetch_one_gstin(
+    gstin: str,
+    api_key: str,
+    token: str,
+    base_url: str,
+    financial_year: str,
+    fetch_profile: bool,
+    fetch_filings: bool,
+    fetch_preference: bool,
+    accept_cache: bool,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    gstin = clean_gstin(gstin)
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    for block in split_capture_blocks(raw_text):
-        gstin = find_field(block, ["GSTIN"]) or find_gstin_in_text(block)
-        gstin = clean_gstin(gstin)
+    customer_row = {
+        "GSTIN": gstin,
+        "Valid Format": gstin_format_valid(gstin),
+        "Checksum Valid": gstin_checksum_valid(gstin) if gstin_format_valid(gstin) else False,
+        "State From GSTIN": gstin_state(gstin),
+        "PAN From GSTIN": pan_from_gstin(gstin),
+        "Legal Name of Business": "",
+        "Trade Name": "",
+        "Constitution of Business": "",
+        "GSTIN / UIN Status": "",
+        "Taxpayer Type": "",
+        "Registration Date": "",
+        "Cancellation Date": "",
+        "Last Updated on GSTN": "",
+        "E-Invoice Status": "",
+        "Nature of Business": "",
+        "Principal Place State": "",
+        "Principal Place City": "",
+        "Principal Place Pincode": "",
+        "Filing Frequency": "",
+        "Preference Detail": "",
+        "API Status": "Not Started",
+        "API Message": "",
+        "Fetched At": now,
+    }
 
-        if not gstin:
-            continue
+    filing_rows: List[Dict[str, Any]] = []
+    error_rows: List[Dict[str, Any]] = []
 
-        details = parse_taxpayer_details(block)
-        row = make_customer_base(gstin)
-        row.update(details)
-        row["Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
-        row["Capture Source"] = "Bookmarklet / Pasted Result"
-        customer_rows.append(row)
+    if not gstin_format_valid(gstin):
+        customer_row["API Status"] = "Skipped"
+        customer_row["API Message"] = "Invalid GSTIN format"
+        return customer_row, filing_rows, [build_error(gstin, "Validation", "Invalid GSTIN format")]
 
-        filing_df = parse_filing_rows(block, gstin)
-        if not filing_df.empty:
-            filing_frames.append(filing_df)
+    if not customer_row["Checksum Valid"]:
+        customer_row["API Status"] = "Warning"
+        customer_row["API Message"] = "GSTIN format is valid but checksum failed. API call skipped."
+        return customer_row, filing_rows, [build_error(gstin, "Validation", "Checksum failed")]
 
-    customers_df = pd.DataFrame(customer_rows, columns=GSTIN_COLUMNS)
-    filings_df = pd.concat(filing_frames, ignore_index=True) if filing_frames else pd.DataFrame(columns=FILING_COLUMNS)
+    if fetch_profile:
+        try:
+            payload = post_api(
+                base_url,
+                SEARCH_GSTIN_ENDPOINT,
+                api_key,
+                token,
+                {"gstin": gstin},
+                accept_cache=accept_cache,
+            )
+            business = extract_business_data(payload)
+            customer_row.update(business)
+            customer_row["API Status"] = "Profile OK"
+            customer_row["API Message"] = "GSTIN profile fetched"
+        except Exception as exc:
+            customer_row["API Status"] = "Profile Failed"
+            customer_row["API Message"] = str(exc)
+            error_rows.append(build_error(gstin, "GSTIN Search", str(exc)))
 
-    return customers_df, filings_df
+    if fetch_preference:
+        try:
+            payload = post_api(
+                base_url,
+                PREFERENCE_ENDPOINT,
+                api_key,
+                token,
+                {"gstin": gstin},
+                params={"financial_year": financial_year},
+                accept_cache=accept_cache,
+            )
+            frequency, preference_detail = extract_preference(payload)
+            customer_row["Filing Frequency"] = frequency
+            customer_row["Preference Detail"] = preference_detail
+        except Exception as exc:
+            if customer_row["API Status"] in ["Not Started", "Profile OK"]:
+                customer_row["API Status"] = "Preference Failed"
+            customer_row["API Message"] = (customer_row["API Message"] + " | " if customer_row["API Message"] else "") + str(exc)
+            error_rows.append(build_error(gstin, "Return Preference", str(exc)))
+
+    if fetch_filings:
+        try:
+            payload = post_api(
+                base_url,
+                TRACK_GSTR_ENDPOINT,
+                api_key,
+                token,
+                {"gstin": gstin},
+                params={"financial_year": financial_year},
+                accept_cache=accept_cache,
+            )
+            filing_rows = extract_filing_rows(payload, gstin, financial_year)
+            if customer_row["API Status"] in ["Not Started", "Profile OK"]:
+                customer_row["API Status"] = "OK"
+            customer_row["API Message"] = (customer_row["API Message"] + " | " if customer_row["API Message"] else "") + f"{len(filing_rows)} filing rows fetched"
+        except Exception as exc:
+            if customer_row["API Status"] in ["Not Started", "Profile OK"]:
+                customer_row["API Status"] = "Filing Failed"
+            customer_row["API Message"] = (customer_row["API Message"] + " | " if customer_row["API Message"] else "") + str(exc)
+            error_rows.append(build_error(gstin, "Track GST Returns", str(exc)))
+
+    if customer_row["API Status"] == "Not Started":
+        customer_row["API Status"] = "Completed"
+        customer_row["API Message"] = "No API option selected"
+
+    return customer_row, filing_rows, error_rows
 
 
-def merge_customers(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
-    if incoming.empty:
-        return existing
+# ============================================================
+# Input / Export
+# ============================================================
+def read_uploaded_gstins(uploaded_file) -> pd.DataFrame:
+    name = uploaded_file.name.lower()
 
-    combined = pd.concat([existing, incoming], ignore_index=True)
-    combined["GSTIN"] = combined["GSTIN"].map(clean_gstin)
-    combined = combined[combined["GSTIN"] != ""]
-    combined = combined.drop_duplicates(subset=["GSTIN"], keep="last")
-    return combined.reindex(columns=GSTIN_COLUMNS).reset_index(drop=True)
+    if name.endswith(".csv"):
+        df = pd.read_csv(uploaded_file, dtype=str)
+    elif name.endswith((".xlsx", ".xls")):
+        df = pd.read_excel(uploaded_file, dtype=str)
+    else:
+        raise ValueError("Upload only CSV or Excel.")
 
-
-def merge_filings(existing: pd.DataFrame, incoming: pd.DataFrame) -> pd.DataFrame:
-    if incoming.empty:
-        return existing
-
-    combined = pd.concat([existing, incoming], ignore_index=True)
-    combined["GSTIN"] = combined["GSTIN"].map(clean_gstin)
-    combined = combined.drop_duplicates(
-        subset=["GSTIN", "Return Type", "Return Period", "Date of Filing", "Status", "ARN", "Raw Text"],
-        keep="last",
-    )
-    return combined.reindex(columns=FILING_COLUMNS).reset_index(drop=True)
+    return df
 
 
-def make_excel(customers_df: pd.DataFrame, filings_df: pd.DataFrame) -> bytes:
+def sample_template() -> bytes:
+    df = pd.DataFrame({"GSTIN": ["27ABCDE1234F1Z5", "07ABCDE1234F1Z2"]})
+    return df.to_csv(index=False).encode("utf-8")
+
+
+def make_excel(customers: pd.DataFrame, filings: pd.DataFrame, errors: pd.DataFrame) -> bytes:
     output = BytesIO()
 
     summary = pd.DataFrame(
         [
-            {"Metric": "Total GSTINs", "Value": len(customers_df)},
-            {"Metric": "Valid GSTIN Format", "Value": int(customers_df["Valid Format"].sum()) if not customers_df.empty else 0},
-            {"Metric": "Checksum Valid", "Value": int(customers_df["Checksum Valid"].sum()) if not customers_df.empty else 0},
-            {"Metric": "Active GSTINs", "Value": int(customers_df["GSTIN / UIN Status"].str.contains("active", case=False, na=False).sum()) if not customers_df.empty else 0},
-            {"Metric": "Filing Rows", "Value": len(filings_df)},
+            {"Metric": "Total GSTINs", "Value": len(customers)},
+            {"Metric": "Successful / Partial Rows", "Value": int(customers["API Status"].str.contains("OK|Profile OK|Completed", case=False, na=False).sum()) if not customers.empty else 0},
+            {"Metric": "Active GSTINs", "Value": int(customers["GSTIN / UIN Status"].str.contains("Active", case=False, na=False).sum()) if not customers.empty else 0},
+            {"Metric": "Filing Rows", "Value": len(filings)},
+            {"Metric": "Error Rows", "Value": len(errors)},
         ]
     )
 
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary.to_excel(writer, index=False, sheet_name="Summary")
-        customers_df.to_excel(writer, index=False, sheet_name="Customer Master")
-        filings_df.to_excel(writer, index=False, sheet_name="Filing Details")
+        customers.to_excel(writer, index=False, sheet_name="Taxpayer Details")
+        filings.to_excel(writer, index=False, sheet_name="Filing Table")
+        errors.to_excel(writer, index=False, sheet_name="Errors")
 
     return output.getvalue()
 
 
-def read_uploaded_table(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
-    if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file, dtype=str)
-    if name.endswith((".xlsx", ".xls")):
-        return pd.read_excel(uploaded_file, dtype=str)
-    raise ValueError("Upload CSV or Excel only.")
-
-
-def make_rows_from_gstin_list(values: list[str]) -> pd.DataFrame:
-    rows = []
-    for value in values:
-        gstin = clean_gstin(value)
-        if gstin:
-            rows.append(make_customer_base(gstin))
-    return pd.DataFrame(rows, columns=GSTIN_COLUMNS)
-
-
-# -------------------------------------------------------------------
-# Session state
-# -------------------------------------------------------------------
-if "customers_df" not in st.session_state:
-    st.session_state.customers_df = pd.DataFrame(columns=GSTIN_COLUMNS)
-
-if "filings_df" not in st.session_state:
-    st.session_state.filings_df = pd.DataFrame(columns=FILING_COLUMNS)
-
-
-# -------------------------------------------------------------------
-# UI
-# -------------------------------------------------------------------
+# ============================================================
+# Streamlit UI
+# ============================================================
 st.set_page_config(
-    page_title="GSTIN One-Click Capture Tracker",
+    page_title="Bulk GSTIN API Lookup",
     page_icon="🧾",
     layout="wide",
 )
 
-st.title("🧾 GSTIN One-Click Capture Tracker")
-st.caption("No API version with bookmarklet helper: solve captcha on GST portal, then capture the result page in one click.")
+st.title("🧾 Bulk GSTIN API Lookup")
+st.caption("Fetch Legal Name, Trade Name, Constitution, Status, Filing Table, and Filing Frequency for multiple GSTINs in one go.")
 
-with st.sidebar:
-    st.header("Best no-API workflow")
-    st.write(
-        "1. Install bookmarklets once\n"
-        "2. Upload or add GSTIN list\n"
-        "3. Open GST portal\n"
-        "4. Solve captcha on GST portal\n"
-        "5. Click Capture GST Result\n"
-        "6. Repeat for GSTINs\n"
-        "7. Click Export GST Captures\n"
-        "8. Paste once into this app"
-    )
-    st.divider()
-    st.link_button("Open GST Portal", GST_PORTAL_URL)
-
-tab_helper, tab_add, tab_import, tab_dashboard, tab_export = st.tabs(
-    ["0. One-Click Helper", "1. GSTIN List", "2. Import Captures", "3. Dashboard", "4. Export"]
-)
-
-# -------------------------------------------------------------------
-# Tab 0: Bookmarklet helper
-# -------------------------------------------------------------------
-with tab_helper:
-    st.subheader("One-Click Capture Helper")
-
-    st.write(
-        "This is the fastest no-API method. It does not submit captcha or search in the backend. "
-        "You use the official GST portal normally, then use these bookmarklets to capture the visible result page."
-    )
-
-    st.write("### Install these 3 bookmarklets")
-    st.write("Create browser bookmarks and paste the following code into each bookmark's URL field.")
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        st.write("#### 1. Capture GST Result")
-        st.code(CAPTURE_BOOKMARKLET_JS, language="javascript")
-        st.write("Click this after one GST result page opens.")
-
-    with c2:
-        st.write("#### 2. Export GST Captures")
-        st.code(EXPORT_BOOKMARKLET_JS, language="javascript")
-        st.write("Click this after capturing all GSTINs. It copies all captures to clipboard.")
-
-    with c3:
-        st.write("#### 3. Clear GST Captures")
-        st.code(CLEAR_BOOKMARKLET_JS, language="javascript")
-        st.write("Use this before starting a fresh batch.")
-
-    st.write("### How it saves time")
+with st.expander("Which login/credentials should I use?", expanded=True):
     st.markdown(
         """
-        Instead of copying each field manually, you only do this per GSTIN:
-        - complete captcha on GST portal
-        - click **Capture GST Result**
+        **Use API provider credentials, not your normal GST portal login.**
 
-        After all GSTINs are captured, click **Export GST Captures** once and paste everything in the next tab.
+        For public GSTIN lookup, return tracking, and return preference, this app needs:
+        - `SANDBOX_API_KEY`
+        - `SANDBOX_API_SECRET`
+
+        You get these from your API provider console, for example Sandbox Console → Settings → API Keys.
+
+        Your **GST portal username/password is not required** for this public lookup app.
+
+        GST portal taxpayer login / OTP consent is needed only for taxpayer-private APIs like downloading GSTR-2A/2B, ledgers, filing returns, etc.
         """
     )
 
-# -------------------------------------------------------------------
-# Tab 1: Add GSTIN list
-# -------------------------------------------------------------------
-with tab_add:
-    st.subheader("GSTIN List")
+with st.sidebar:
+    st.header("API Settings")
+
+    env_default = os.getenv("SANDBOX_ENV", "production").lower()
+    env = st.selectbox(
+        "Environment",
+        ["production", "test"],
+        index=0 if env_default == "production" else 1,
+        help="Use production for live data and test for Sandbox test environment.",
+    )
+    base_url = get_base_url(env)
+
+    api_key = st.text_input(
+        "Sandbox API Key",
+        value=os.getenv("SANDBOX_API_KEY", ""),
+        type="password",
+    )
+    api_secret = st.text_input(
+        "Sandbox API Secret",
+        value=os.getenv("SANDBOX_API_SECRET", ""),
+        type="password",
+    )
+
+    financial_year = st.text_input("Financial Year", value="FY 2025-26", help="Example: FY 2025-26")
+
+    fetch_profile = st.checkbox("Fetch Taxpayer Profile", value=True)
+    fetch_filings = st.checkbox("Fetch Filing Table", value=True)
+    fetch_preference = st.checkbox("Fetch Filing Frequency", value=True)
+    accept_cache = st.checkbox("Accept Cached API Response", value=True)
+    delay_seconds = st.number_input("Delay between GSTIN calls (seconds)", min_value=0.0, max_value=10.0, value=0.3, step=0.1)
+
+    st.download_button(
+        "Download CSV Template",
+        data=sample_template(),
+        file_name="bulk_gstin_template.csv",
+        mime="text/csv",
+    )
+
+tab_input, tab_run, tab_results = st.tabs(["1. Input GSTINs", "2. Run API", "3. Results & Export"])
+
+with tab_input:
+    st.subheader("Input Multiple GSTINs")
 
     col1, col2 = st.columns(2)
 
     with col1:
         st.write("### Paste GSTINs")
-        pasted_gstins = st.text_area(
-            "Paste one GSTIN per line",
-            height=200,
+        pasted = st.text_area(
+            "Paste GSTINs, one per line",
+            height=240,
             placeholder="27ABCDE1234F1Z5\n07ABCDE1234F1Z2",
         )
 
-        if st.button("Add Pasted GSTINs", type="primary"):
-            values = [line.strip() for line in pasted_gstins.splitlines() if line.strip()]
-            incoming = make_rows_from_gstin_list(values)
-            st.session_state.customers_df = merge_customers(st.session_state.customers_df, incoming)
-            st.success(f"Added/updated {len(incoming)} GSTIN rows.")
-
     with col2:
         st.write("### Upload CSV/Excel")
-        uploaded = st.file_uploader("Upload file with GSTIN column", type=["csv", "xlsx", "xls"])
-        if uploaded:
-            try:
-                df = read_uploaded_table(uploaded)
-                st.dataframe(df.head(10), use_container_width=True)
-                columns = list(df.columns)
+        uploaded = st.file_uploader("Upload file", type=["csv", "xlsx", "xls"])
 
-                default_index = 0
-                for i, col in enumerate(columns):
-                    if "gst" in str(col).lower():
-                        default_index = i
-                        break
+    gstin_list: List[str] = []
 
-                gst_col = st.selectbox("Select GSTIN column", columns, index=default_index)
+    if pasted.strip():
+        gstin_list.extend([clean_gstin(line) for line in pasted.splitlines() if clean_gstin(line)])
 
-                if st.button("Import Uploaded GSTINs"):
-                    incoming = make_rows_from_gstin_list(df[gst_col].dropna().astype(str).tolist())
-                    st.session_state.customers_df = merge_customers(st.session_state.customers_df, incoming)
-                    st.success(f"Imported {len(incoming)} GSTIN rows.")
-            except Exception as exc:
-                st.error(f"Upload failed: {exc}")
+    if uploaded is not None:
+        try:
+            df_upload = read_uploaded_gstins(uploaded)
+            st.write("Uploaded preview")
+            st.dataframe(df_upload.head(10), use_container_width=True)
 
-    st.write("### Current GSTIN Master")
-    if st.session_state.customers_df.empty:
-        st.info("No GSTINs added yet.")
+            columns = list(df_upload.columns)
+            default_idx = 0
+            for i, col in enumerate(columns):
+                if "gst" in str(col).lower():
+                    default_idx = i
+                    break
+
+            selected_col = st.selectbox("Select GSTIN column", columns, index=default_idx)
+            gstin_list.extend(df_upload[selected_col].dropna().astype(str).map(clean_gstin).tolist())
+        except Exception as exc:
+            st.error(f"Could not read uploaded file: {exc}")
+
+    gstin_list = sorted(set([g for g in gstin_list if g]))
+
+    st.write("### GSTIN Validation Preview")
+    if not gstin_list:
+        st.info("Paste GSTINs or upload a file.")
     else:
-        edited = st.data_editor(
-            st.session_state.customers_df,
-            use_container_width=True,
-            num_rows="dynamic",
-            disabled=["State", "PAN", "Valid Format", "Checksum Valid"],
+        preview_df = pd.DataFrame(
+            [
+                {
+                    "GSTIN": g,
+                    "Valid Format": gstin_format_valid(g),
+                    "Checksum Valid": gstin_checksum_valid(g) if gstin_format_valid(g) else False,
+                    "State": gstin_state(g),
+                    "PAN": pan_from_gstin(g),
+                }
+                for g in gstin_list
+            ]
         )
+        st.dataframe(preview_df, use_container_width=True)
+        st.session_state["gstin_list"] = gstin_list
 
-        if st.button("Save GSTIN Master Edits"):
-            edited = edited.copy()
-            edited["GSTIN"] = edited["GSTIN"].map(clean_gstin)
-            edited["State"] = edited["GSTIN"].map(gstin_state)
-            edited["PAN"] = edited["GSTIN"].map(pan_from_gstin)
-            edited["Valid Format"] = edited["GSTIN"].map(gstin_format_valid)
-            edited["Checksum Valid"] = edited["GSTIN"].map(lambda x: gstin_checksum_valid(x) if gstin_format_valid(x) else False)
-            st.session_state.customers_df = edited.drop_duplicates(subset=["GSTIN"], keep="last").reset_index(drop=True)
-            st.success("GSTIN master saved.")
+with tab_run:
+    st.subheader("Run Bulk API Lookup")
 
-# -------------------------------------------------------------------
-# Tab 2: Import captures
-# -------------------------------------------------------------------
-with tab_import:
-    st.subheader("Import Captured GST Results")
+    gstin_list = st.session_state.get("gstin_list", [])
 
-    st.write(
-        "After using **Export GST Captures**, paste the copied text below. "
-        "The app will read all captured blocks together."
-    )
+    if not gstin_list:
+        st.info("Go to Input GSTINs tab and add GSTINs first.")
+    elif not api_key or not api_secret:
+        st.warning("Enter Sandbox API Key and API Secret in the sidebar.")
+    else:
+        st.write(f"Ready to process **{len(gstin_list)} GSTINs** for **{financial_year}**.")
 
-    raw_capture = st.text_area(
-        "Paste exported GST captures here",
-        height=360,
-        placeholder="===== GST_CAPTURE_START =====\nGSTIN: ...\n...\n===== GST_CAPTURE_END =====",
-    )
+        if st.button("Start Bulk API Lookup", type="primary"):
+            progress = st.progress(0)
+            status_box = st.empty()
 
-    parsed_customers, parsed_filings = parse_capture_blocks(raw_capture)
+            customer_rows: List[Dict[str, Any]] = []
+            filing_rows_all: List[Dict[str, Any]] = []
+            error_rows_all: List[Dict[str, Any]] = []
 
-    if raw_capture:
-        st.write("### Parsed Preview")
-        pc1, pc2 = st.columns(2)
-        pc1.metric("Parsed Customers", len(parsed_customers))
-        pc2.metric("Parsed Filing Rows", len(parsed_filings))
+            try:
+                status_box.info("Authenticating with API provider...")
+                token = authenticate(api_key, api_secret, base_url)
+                status_box.success("Authentication successful.")
+            except Exception as exc:
+                st.error(f"Authentication failed: {exc}")
+                st.stop()
 
-        if not parsed_customers.empty:
-            st.write("#### Customer Details Found")
-            st.dataframe(parsed_customers, use_container_width=True)
+            for idx, gstin in enumerate(gstin_list, start=1):
+                status_box.info(f"Processing {idx}/{len(gstin_list)}: {gstin}")
 
-        if not parsed_filings.empty:
-            st.write("#### Filing Rows Found")
-            st.dataframe(parsed_filings, use_container_width=True)
+                customer_row, filing_rows, error_rows = fetch_one_gstin(
+                    gstin=gstin,
+                    api_key=api_key,
+                    token=token,
+                    base_url=base_url,
+                    financial_year=financial_year,
+                    fetch_profile=fetch_profile,
+                    fetch_filings=fetch_filings,
+                    fetch_preference=fetch_preference,
+                    accept_cache=accept_cache,
+                )
 
-        if st.button("Save Parsed Captures", type="primary"):
-            st.session_state.customers_df = merge_customers(st.session_state.customers_df, parsed_customers)
-            st.session_state.filings_df = merge_filings(st.session_state.filings_df, parsed_filings)
-            st.success(f"Saved {len(parsed_customers)} customers and {len(parsed_filings)} filing rows.")
+                customer_rows.append(customer_row)
+                filing_rows_all.extend(filing_rows)
+                error_rows_all.extend(error_rows)
 
-# -------------------------------------------------------------------
-# Tab 3: Dashboard
-# -------------------------------------------------------------------
-with tab_dashboard:
-    st.subheader("Dashboard")
+                progress.progress(idx / len(gstin_list))
 
-    customers = st.session_state.customers_df
-    filings = st.session_state.filings_df
+                if delay_seconds:
+                    time.sleep(float(delay_seconds))
+
+            st.session_state["customers_df"] = pd.DataFrame(customer_rows, columns=CUSTOMER_COLUMNS)
+            st.session_state["filings_df"] = pd.DataFrame(filing_rows_all, columns=FILING_COLUMNS)
+            st.session_state["errors_df"] = pd.DataFrame(error_rows_all, columns=ERROR_COLUMNS)
+
+            status_box.success("Bulk API lookup completed.")
+
+with tab_results:
+    st.subheader("Results & Export")
+
+    customers = st.session_state.get("customers_df", pd.DataFrame(columns=CUSTOMER_COLUMNS))
+    filings = st.session_state.get("filings_df", pd.DataFrame(columns=FILING_COLUMNS))
+    errors = st.session_state.get("errors_df", pd.DataFrame(columns=ERROR_COLUMNS))
 
     if customers.empty:
-        st.info("No data yet.")
+        st.info("No results yet. Run the API lookup first.")
     else:
-        total = len(customers)
-        valid = int(customers["Valid Format"].sum())
-        checksum = int(customers["Checksum Valid"].sum())
-        active = int(customers["GSTIN / UIN Status"].str.contains("active", case=False, na=False).sum())
-        filing_rows = len(filings)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("GSTINs Processed", len(customers))
+        m2.metric("Active GSTINs", int(customers["GSTIN / UIN Status"].str.contains("Active", case=False, na=False).sum()))
+        m3.metric("Filing Rows", len(filings))
+        m4.metric("Errors", len(errors))
 
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Total GSTINs", total)
-        m2.metric("Valid Format", valid)
-        m3.metric("Checksum Valid", checksum)
-        m4.metric("Active", active)
-        m5.metric("Filing Rows", filing_rows)
+        st.write("### Taxpayer Details")
+        st.dataframe(customers, use_container_width=True)
 
-        st.write("### Customer Master")
-        edited_customers = st.data_editor(customers, use_container_width=True, num_rows="dynamic")
-        if st.button("Save Customer Dashboard Edits"):
-            st.session_state.customers_df = edited_customers.reindex(columns=GSTIN_COLUMNS)
-            st.success("Customer changes saved.")
+        st.write("### Filing Table in Detail")
+        st.dataframe(filings, use_container_width=True)
 
-        st.write("### Filing Details")
-        edited_filings = st.data_editor(filings, use_container_width=True, num_rows="dynamic")
-        if st.button("Save Filing Dashboard Edits"):
-            st.session_state.filings_df = edited_filings.reindex(columns=FILING_COLUMNS)
-            st.success("Filing changes saved.")
+        if not errors.empty:
+            st.write("### Errors / Failed GSTINs")
+            st.dataframe(errors, use_container_width=True)
 
-        st.write("### Status Summary")
-        status_summary = customers["GSTIN / UIN Status"].replace("", "Blank").fillna("Blank").value_counts().reset_index()
-        status_summary.columns = ["Status", "Count"]
-        st.dataframe(status_summary, use_container_width=True)
-
-        if not filings.empty:
-            st.write("### Return Type Summary")
-            return_summary = filings["Return Type"].replace("", "Blank").fillna("Blank").value_counts().reset_index()
-            return_summary.columns = ["Return Type", "Count"]
-            st.dataframe(return_summary, use_container_width=True)
-
-# -------------------------------------------------------------------
-# Tab 4: Export
-# -------------------------------------------------------------------
-with tab_export:
-    st.subheader("Export")
-
-    customers = st.session_state.customers_df
-    filings = st.session_state.filings_df
-
-    if customers.empty:
-        st.info("Nothing to export yet.")
-    else:
-        excel_bytes = make_excel(customers, filings)
+        excel_bytes = make_excel(customers, filings, errors)
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
 
-        st.download_button(
-            "Download Full Excel Report",
-            data=excel_bytes,
-            file_name=f"gstin_one_click_report_{stamp}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            type="primary",
-        )
-
-        st.download_button(
-            "Download Customer Master CSV",
-            data=customers.to_csv(index=False).encode("utf-8"),
-            file_name=f"customer_master_{stamp}.csv",
-            mime="text/csv",
-        )
-
-        st.download_button(
-            "Download Filing Details CSV",
-            data=filings.to_csv(index=False).encode("utf-8"),
-            file_name=f"filing_details_{stamp}.csv",
-            mime="text/csv",
-        )
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.download_button(
+                "Download Full Excel Report",
+                data=excel_bytes,
+                file_name=f"bulk_gstin_api_report_{stamp}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
+            )
+        with col_b:
+            st.download_button(
+                "Download Taxpayer Details CSV",
+                data=customers.to_csv(index=False).encode("utf-8"),
+                file_name=f"taxpayer_details_{stamp}.csv",
+                mime="text/csv",
+            )
+        with col_c:
+            st.download_button(
+                "Download Filing Table CSV",
+                data=filings.to_csv(index=False).encode("utf-8"),
+                file_name=f"filing_table_{stamp}.csv",
+                mime="text/csv",
+            )
