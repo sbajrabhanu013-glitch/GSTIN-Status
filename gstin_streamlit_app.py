@@ -16,16 +16,18 @@ def validate_gstin(gstin):
 # -------------------------------
 # Fetch Captcha
 # -------------------------------
-def fetch_captcha(session):
+def fetch_captcha(session, debug=False):
     captcha_page = session.get(GST_PORTAL_URL)
     soup = BeautifulSoup(captcha_page.text, "html.parser")
-    # Try multiple ways to locate captcha image
     captcha_img_tag = soup.find("img", {"id": "captchaImg"}) \
                       or soup.find("img", {"class": "captcha-img"}) \
                       or soup.find("img", {"alt": "Captcha"})
     if captcha_img_tag and "src" in captcha_img_tag.attrs:
         captcha_url = "https://services.gst.gov.in" + captcha_img_tag["src"]
         return captcha_url
+    if debug:
+        # Show a snippet of HTML around where captcha should be
+        return soup.prettify()[0:1000]  # first 1000 chars for inspection
     return None
 
 # -------------------------------
@@ -64,14 +66,15 @@ def parse_result(html):
 st.title("GST Taxpayer Search App")
 
 gstin = st.text_input("Enter GSTIN")
+debug_mode = st.checkbox("Enable Debug Mode (show raw HTML snippet)")
 
 if gstin:
     if validate_gstin(gstin):
         st.success("GSTIN format looks valid.")
         session = requests.Session()
-        captcha_url = fetch_captcha(session)
+        captcha_url = fetch_captcha(session, debug=debug_mode)
         
-        if captcha_url:
+        if captcha_url and captcha_url.startswith("http"):
             st.image(captcha_url, caption="Enter Captcha")
             captcha = st.text_input("Captcha")
             
@@ -95,6 +98,7 @@ if gstin:
                         st.download_button("Download as PDF", df.to_string().encode("utf-8"), "filing_table.pdf")
         else:
             st.error("Could not fetch captcha. GST portal HTML may have changed.")
-            st.info("Tip: Inspect the GST portal manually and update the selector in fetch_captcha().")
+            if debug_mode and captcha_url:
+                st.text_area("Raw HTML snippet", captcha_url, height=300)
     else:
         st.error("Invalid GSTIN format. Please check again.")
