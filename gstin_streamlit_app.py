@@ -1,7 +1,13 @@
 import re
 import pandas as pd
 import streamlit as st
-from playwright.sync_api import sync_playwright
+import time
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+import chromedriver_autoinstaller
+
+# Auto-install ChromeDriver
+chromedriver_autoinstaller.install()
 
 GST_PORTAL_URL = "https://services.gst.gov.in/services/searchtp"
 
@@ -13,49 +19,58 @@ def validate_gstin(gstin):
     return re.match(pattern, gstin)
 
 # -------------------------------
-# Playwright Workflow
+# Selenium Workflow
 # -------------------------------
 def gst_search(gstin, captcha_text):
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
-        page.goto(GST_PORTAL_URL, timeout=60000)
+    options = webdriver.ChromeOptions()
+    options.add_argument("--headless")  # run headless for Streamlit Cloud
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
 
-        # Wait for captcha image
-        page.wait_for_selector("img#captchaImg", timeout=10000)
-        captcha_src = page.locator("img#captchaImg").get_attribute("src")
-        captcha_url = "https://services.gst.gov.in" + captcha_src
+    driver = webdriver.Chrome(options=options)
+    driver.get(GST_PORTAL_URL)
+    time.sleep(3)  # wait for JS to load
 
-        # Fill GSTIN and captcha
-        page.fill("input#gstin", gstin)
-        page.fill("input#captcha", captcha_text)
-        page.click("button#searchBtn")
+    # Captcha image
+    captcha_img = driver.find_element(By.ID, "captchaImg")
+    captcha_src = captcha_img.get_attribute("src")
+    captcha_url = "https://services.gst.gov.in" + captcha_src
 
-        # Wait for results
-        page.wait_for_selector("span#legalName", timeout=15000)
+    # Fill GSTIN and captcha
+    gstin_input = driver.find_element(By.ID, "gstin")
+    gstin_input.send_keys(gstin)
+    captcha_input = driver.find_element(By.ID, "captcha")
+    captcha_input.send_keys(captcha_text)
 
-        # Extract details
-        result = {}
-        result["Legal Name"] = page.locator("span#legalName").inner_text()
-        result["Trade Name"] = page.locator("span#tradeName").inner_text()
-        result["Status"] = page.locator("span#status").inner_text()
-        result["Filing Frequency"] = page.locator("span#filingFreq").inner_text()
+    # Submit
+    submit_btn = driver.find_element(By.ID, "searchBtn")
+    submit_btn.click()
+    time.sleep(3)
 
-        # Filing table
+    # Extract taxpayer details
+    result = {}
+    try:
+        result["Legal Name"] = driver.find_element(By.ID, "legalName").text
+        result["Trade Name"] = driver.find_element(By.ID, "tradeName").text
+        result["Status"] = driver.find_element(By.ID, "status").text
+        result["Filing Frequency"] = driver.find_element(By.ID, "filingFreq").text
+
         filing_table = []
-        rows = page.locator("table#filingTable tr").all()
+        rows = driver.find_elements(By.CSS_SELECTOR, "table#filingTable tr")
         for row in rows[1:]:
-            cols = [c.inner_text().strip() for c in row.locator("td").all()]
+            cols = [col.text.strip() for col in row.find_elements(By.TAG_NAME, "td")]
             filing_table.append(cols)
         result["Filing Table"] = filing_table
+    except Exception as e:
+        result["Error"] = f"Parsing failed: {e}"
 
-        browser.close()
-        return captcha_url, result
+    driver.quit()
+    return captcha_url, result
 
 # -------------------------------
 # Streamlit UI
 # -------------------------------
-st.title("GST Taxpayer Search App (Playwright)")
+st.title("GST Taxpayer Search App (Selenium)")
 
 gstin = st.text_input("Enter GSTIN")
 
@@ -63,33 +78,40 @@ if gstin:
     if validate_gstin(gstin):
         st.success("GSTIN format looks valid.")
 
-        # Step 1: Show captcha
+        captcha_url = None
         if st.button("Fetch Captcha"):
-            with sync_playwright() as p:
-                browser = p.chromium.launch(headless=True)
-                page = browser.new_page()
-                page.goto(GST_PORTAL_URL, timeout=60000)
-                page.wait_for_selector("img#captchaImg", timeout=10000)
-                captcha_src = page.locator("img#captchaImg").get_attribute("src")
-                captcha_url = "https://services.gst.gov.in" + captcha_src
-                st.image(captcha_url, caption="Enter Captcha")
-                browser.close()
+            # Launch browser just to get captcha
+            options = webdriver.ChromeOptions()
+            options.add_argument("--headless")
+            options.add_argument("--no-sandbox")
+            options.add_argument("--disable-dev-shm-usage")
+            driver = webdriver.Chrome(options=options)
+            driver.get(GST_PORTAL_URL)
+            time.sleep(3)
+            captcha_img = driver.find_element(By.ID, "captchaImg")
+            captcha_src = captcha_img.get_attribute("src")
+            captcha_url = "https://services.gst.gov.in" + captcha_src
+            st.image(captcha_url, caption="Enter Captcha")
+            driver.quit()
 
         captcha = st.text_input("Captcha")
 
         if captcha and st.button("Submit Search"):
             captcha_url, result = gst_search(gstin, captcha)
 
-            st.subheader("Taxpayer Details")
-            st.write("**Legal Name:**", result.get("Legal Name", "N/A"))
-            st.write("**Trade Name:**", result.get("Trade Name", "N/A"))
-            st.write("**Status:**", result.get("Status", "N/A"))
-            st.write("**Filing Frequency:**", result.get("Filing Frequency", "N/A"))
+            if "Error" in result:
+                st.error(result["Error"])
+            else:
+                st.subheader("Taxpayer Details")
+                st.write("**Legal Name:**", result.get("Legal Name", "N/A"))
+                st.write("**Trade Name:**", result.get("Trade Name", "N/A"))
+                st.write("**Status:**", result.get("Status", "N/A"))
+                st.write("**Filing Frequency:**", result.get("Filing Frequency", "N/A"))
 
-            if result.get("Filing Table"):
-                df = pd.DataFrame(result["Filing Table"], columns=["Period", "Return Type", "Status"])
-                st.dataframe(df)
-                st.download_button("Download as Excel", df.to_csv(index=False).encode("utf-8"), "filing_table.csv")
-                st.download_button("Download as PDF", df.to_string().encode("utf-8"), "filing_table.pdf")
+                if result.get("Filing Table"):
+                    df = pd.DataFrame(result["Filing Table"], columns=["Period", "Return Type", "Status"])
+                    st.dataframe(df)
+                    st.download_button("Download as Excel", df.to_csv(index=False).encode("utf-8"), "filing_table.csv")
+                    st.download_button("Download as PDF", df.to_string().encode("utf-8"), "filing_table.pdf")
     else:
         st.error("Invalid GSTIN format. Please check again.")
