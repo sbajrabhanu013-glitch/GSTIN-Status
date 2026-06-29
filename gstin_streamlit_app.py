@@ -7,18 +7,17 @@ import streamlit as st
 GST_PORTAL_URL = "https://services.gst.gov.in/services/searchtp"
 
 # -------------------------------
-# Step 1: GSTIN Validation
+# GSTIN Validation
 # -------------------------------
 def validate_gstin(gstin):
     pattern = r'^[0-9]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$'
     return re.match(pattern, gstin)
 
 # -------------------------------
-# Step 2: Fetch Captcha
+# Fetch Captcha
 # -------------------------------
 def fetch_captcha(session):
     captcha_page = session.get(GST_PORTAL_URL)
-    # Parse captcha image URL from HTML
     soup = BeautifulSoup(captcha_page.text, "html.parser")
     captcha_img_tag = soup.find("img", {"id": "captchaImg"})
     if captcha_img_tag:
@@ -27,7 +26,7 @@ def fetch_captcha(session):
     return None
 
 # -------------------------------
-# Step 3: Submit GSTIN + Captcha
+# Submit GSTIN + Captcha
 # -------------------------------
 def submit_search(session, gstin, captcha):
     payload = {"gstin": gstin, "captcha": captcha}
@@ -35,7 +34,7 @@ def submit_search(session, gstin, captcha):
     return response.text
 
 # -------------------------------
-# Step 4: Parse Result Page
+# Parse Result Page
 # -------------------------------
 def parse_result(html):
     soup = BeautifulSoup(html, "html.parser")
@@ -45,7 +44,6 @@ def parse_result(html):
         result["Trade Name"] = soup.find("span", {"id": "tradeName"}).text.strip()
         result["Status"] = soup.find("span", {"id": "status"}).text.strip()
         result["Filing Frequency"] = soup.find("span", {"id": "filingFreq"}).text.strip()
-        # Filing Table example
         filing_table = []
         table = soup.find("table", {"id": "filingTable"})
         if table:
@@ -91,7 +89,6 @@ if gstin:
                         df = pd.DataFrame(result["Filing Table"], columns=["Period", "Return Type", "Status"])
                         st.dataframe(df)
                         
-                        # Export options
                         st.download_button("Download as Excel", df.to_csv(index=False).encode("utf-8"), "filing_table.csv")
                         st.download_button("Download as PDF", df.to_string().encode("utf-8"), "filing_table.pdf")
         else:
