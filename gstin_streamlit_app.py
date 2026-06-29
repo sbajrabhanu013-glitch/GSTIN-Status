@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -20,11 +21,42 @@ PROD_BASE_URL = "https://api.sandbox.co.in"
 TEST_BASE_URL = "https://test-api.sandbox.co.in"
 
 AUTH_ENDPOINT = "/authenticate"
+
+# Public API endpoints
 SEARCH_GSTIN_ENDPOINT = "/gst/compliance/public/gstin/search"
 TRACK_GSTR_ENDPOINT = "/gst/compliance/public/gstrs/track"
 PREFERENCE_ENDPOINT = "/gst/compliance/public/gstrs/preference"
 
-DEFAULT_TIMEOUT = 45
+# Taxpayer-private API endpoints
+TAXPAYER_OTP_ENDPOINT = "/gst/compliance/tax-payer/otp"
+TAXPAYER_OTP_VERIFY_ENDPOINT = "/gst/compliance/tax-payer/otp/verify"
+GSTR3B_DETAILS_ENDPOINT_TEMPLATE = "/gst/compliance/tax-payer/gstrs/gstr-3b/{year}/{month}"
+
+# GSTR-1 document sections.
+# Endpoint pattern: /gst/compliance/tax-payer/gstrs/gstr-1/{section}/{year}/{month}
+GSTR1_SECTIONS = {
+    "B2B": "b2b",
+    "B2BA": "b2ba",
+    "B2CL": "b2cl",
+    "B2CLA": "b2cla",
+    "B2CS": "b2cs",
+    "B2CSA": "b2csa",
+    "CDNR": "cdnr",
+    "CDNRA": "cdnra",
+    "CDNUR": "cdnur",
+    "CDNURA": "cdnura",
+    "EXP": "exp",
+    "EXPA": "expa",
+    "AT": "at",
+    "ATA": "ata",
+    "TXP": "txp",
+    "TXPA": "txpa",
+    "NIL": "nil",
+    "HSN": "hsn",
+    "DOC-ISSUE": "doc-issue",
+}
+
+DEFAULT_TIMEOUT = 60
 
 STATE_CODES = {
     "01": "Jammu & Kashmir",
@@ -115,6 +147,50 @@ ERROR_COLUMNS = [
     "Fetched At",
 ]
 
+RETURN_RESPONSE_COLUMNS = [
+    "GSTIN",
+    "Return",
+    "Section",
+    "Year",
+    "Month",
+    "Status",
+    "Message",
+    "Transaction ID",
+    "Fetched At",
+    "Raw JSON",
+]
+
+RETURN_FACT_COLUMNS = [
+    "GSTIN",
+    "Return",
+    "Section",
+    "Year",
+    "Month",
+    "Path",
+    "Value",
+]
+
+GSTR1_INVOICE_COLUMNS = [
+    "GSTIN",
+    "Year",
+    "Month",
+    "Section",
+    "Counterparty GSTIN",
+    "Invoice Number",
+    "Invoice Date",
+    "Invoice Value",
+    "Invoice Type",
+    "POS",
+    "Reverse Charge",
+    "Taxable Value",
+    "IGST",
+    "CGST",
+    "SGST",
+    "CESS",
+    "Source Type",
+    "Raw Path",
+]
+
 
 # ============================================================
 # GSTIN Validation
@@ -165,8 +241,20 @@ def pan_from_gstin(gstin: str) -> str:
     return gstin[2:12] if len(gstin) >= 12 else ""
 
 
+def parse_period_to_year_month(return_period: str) -> Tuple[str, str]:
+    """
+    Converts GST return period like 052026 into (year=2026, month=05).
+    """
+    value = re.sub(r"[^0-9]", "", str(return_period or ""))
+    if len(value) == 6:
+        month = value[:2]
+        year = value[2:]
+        return year, month
+    return "", ""
+
+
 # ============================================================
-# API Helpers
+# Common API Helpers
 # ============================================================
 def get_base_url(env: str) -> str:
     return PROD_BASE_URL if env.lower() == "production" else TEST_BASE_URL
@@ -181,31 +269,19 @@ def get_nested(data: Dict[str, Any], *keys: str, default: Any = None) -> Any:
     return current if current is not None else default
 
 
-def make_headers(api_key: str, token: str, accept_cache: bool = True) -> Dict[str, str]:
+def authenticate(api_key: str, api_secret: str, base_url: str) -> str:
+    """
+    Authenticates your Sandbox/API-provider account.
+    This is NOT GST portal username/password.
+    """
+    url = f"{base_url}{AUTH_ENDPOINT}"
     headers = {
         "x-api-key": (api_key or "").strip(),
-        "authorization": (token or "").strip(),
-        "x-api-version": "1.0",
-        "Content-Type": "application/json",
-    }
-    if accept_cache:
-        headers["x-accept-cache"] = "true"
-    return headers
-
-
-def authenticate(api_key: str, api_secret: str, base_url: str) -> str:
-    url = f"{base_url}{AUTH_ENDPOINT}"
-    api_key = (api_key or "").strip()
-    api_secret = (api_secret or "").strip()
-
-    # Keep authentication headers exactly like Sandbox's working cURL/auth docs.
-    # Do not send GST portal username/password here.
-    headers = {
-        "x-api-key": api_key,
-        "x-api-secret": api_secret,
+        "x-api-secret": (api_secret or "").strip(),
     }
 
     response = requests.post(url, headers=headers, timeout=DEFAULT_TIMEOUT)
+
     try:
         payload = response.json()
     except Exception:
@@ -222,6 +298,27 @@ def authenticate(api_key: str, api_secret: str, base_url: str) -> str:
     return token
 
 
+def make_app_headers(api_key: str, token: str, accept_cache: bool = True) -> Dict[str, str]:
+    headers = {
+        "x-api-key": (api_key or "").strip(),
+        "authorization": (token or "").strip(),
+        "x-api-version": "1.0",
+        "Content-Type": "application/json",
+    }
+    if accept_cache:
+        headers["x-accept-cache"] = "true"
+    return headers
+
+
+def make_taxpayer_headers(api_key: str, taxpayer_token: str) -> Dict[str, str]:
+    return {
+        "x-api-key": (api_key or "").strip(),
+        "authorization": (taxpayer_token or "").strip(),
+        "x-api-version": "1.0.0",
+        "Content-Type": "application/json",
+    }
+
+
 def post_api(
     base_url: str,
     endpoint: str,
@@ -234,7 +331,7 @@ def post_api(
     url = f"{base_url}{endpoint}"
     response = requests.post(
         url,
-        headers=make_headers(api_key, token, accept_cache=accept_cache),
+        headers=make_app_headers(api_key, token, accept_cache=accept_cache),
         json=body,
         params=params or {},
         timeout=DEFAULT_TIMEOUT,
@@ -253,9 +350,72 @@ def post_api(
     return payload
 
 
+def taxpayer_post_api(
+    base_url: str,
+    endpoint: str,
+    api_key: str,
+    authorization_token: str,
+    body: Dict[str, Any],
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    Used for Generate OTP and Verify OTP.
+    authorization_token is the normal Sandbox access token until OTP is verified.
+    """
+    url = f"{base_url}{endpoint}"
+    response = requests.post(
+        url,
+        headers=make_taxpayer_headers(api_key, authorization_token),
+        json=body,
+        params=params or {},
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    try:
+        payload = response.json()
+    except Exception:
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+        raise RuntimeError(f"Invalid JSON response: {response.text[:500]}")
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {payload}")
+
+    return payload
+
+
+def taxpayer_get_api(
+    base_url: str,
+    endpoint: str,
+    api_key: str,
+    taxpayer_token: str,
+    params: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    url = f"{base_url}{endpoint}"
+    response = requests.get(
+        url,
+        headers=make_taxpayer_headers(api_key, taxpayer_token),
+        params=params or {},
+        timeout=DEFAULT_TIMEOUT,
+    )
+
+    try:
+        payload = response.json()
+    except Exception:
+        if response.status_code >= 400:
+            raise RuntimeError(f"HTTP {response.status_code}: {response.text[:500]}")
+        raise RuntimeError(f"Invalid JSON response: {response.text[:500]}")
+
+    if response.status_code >= 400:
+        raise RuntimeError(f"HTTP {response.status_code}: {payload}")
+
+    return payload
+
+
+# ============================================================
+# Public GSTIN APIs
+# ============================================================
 def extract_business_data(search_payload: Dict[str, Any]) -> Dict[str, Any]:
-    # Sandbox responses normally nest actual taxpayer data here:
-    # response["data"]["data"]
     data = get_nested(search_payload, "data", "data", default={})
     if not isinstance(data, dict):
         data = {}
@@ -472,19 +632,256 @@ def fetch_one_gstin(
 
 
 # ============================================================
+# Taxpayer Authentication + Private Return APIs
+# ============================================================
+def generate_taxpayer_otp(
+    base_url: str,
+    api_key: str,
+    app_token: str,
+    gstin: str,
+    username: str,
+) -> Dict[str, Any]:
+    return taxpayer_post_api(
+        base_url,
+        TAXPAYER_OTP_ENDPOINT,
+        api_key,
+        app_token,
+        {"username": username.strip(), "gstin": clean_gstin(gstin)},
+    )
+
+
+def verify_taxpayer_otp(
+    base_url: str,
+    api_key: str,
+    app_token: str,
+    gstin: str,
+    username: str,
+    otp: str,
+) -> Dict[str, Any]:
+    return taxpayer_post_api(
+        base_url,
+        TAXPAYER_OTP_VERIFY_ENDPOINT,
+        api_key,
+        app_token,
+        {"username": username.strip(), "gstin": clean_gstin(gstin)},
+        params={"otp": otp.strip()},
+    )
+
+
+def fetch_gstr3b_details(
+    base_url: str,
+    api_key: str,
+    taxpayer_token: str,
+    year: str,
+    month: str,
+) -> Dict[str, Any]:
+    endpoint = GSTR3B_DETAILS_ENDPOINT_TEMPLATE.format(year=year.strip(), month=month.strip())
+    return taxpayer_get_api(base_url, endpoint, api_key, taxpayer_token)
+
+
+def fetch_gstr1_section(
+    base_url: str,
+    api_key: str,
+    taxpayer_token: str,
+    section_slug: str,
+    year: str,
+    month: str,
+) -> Dict[str, Any]:
+    endpoint = f"/gst/compliance/tax-payer/gstrs/gstr-1/{section_slug}/{year.strip()}/{month.strip()}"
+    return taxpayer_get_api(base_url, endpoint, api_key, taxpayer_token)
+
+
+def response_status_message(payload: Dict[str, Any]) -> Tuple[str, str]:
+    status_cd = get_nested(payload, "data", "status_cd", default="")
+    err = get_nested(payload, "data", "error", default={})
+    if isinstance(err, dict) and err:
+        return str(status_cd or "0"), f"{err.get('error_cd', '')} {err.get('message', '')}".strip()
+    if str(status_cd) == "1":
+        return "1", "Success"
+    return str(status_cd or ""), ""
+
+
+def json_leaf_rows(
+    obj: Any,
+    context: Dict[str, Any],
+    path: str = "",
+    rows: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    if rows is None:
+        rows = []
+
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            new_path = f"{path}.{key}" if path else str(key)
+            json_leaf_rows(value, context, new_path, rows)
+    elif isinstance(obj, list):
+        for idx, value in enumerate(obj):
+            new_path = f"{path}[{idx}]"
+            json_leaf_rows(value, context, new_path, rows)
+    else:
+        row = dict(context)
+        row["Path"] = path
+        row["Value"] = obj
+        rows.append(row)
+
+    return rows
+
+
+def sum_item_amounts(invoice: Dict[str, Any]) -> Dict[str, float]:
+    totals = {"txval": 0.0, "iamt": 0.0, "camt": 0.0, "samt": 0.0, "csamt": 0.0}
+    itms = invoice.get("itms", [])
+    if not isinstance(itms, list):
+        return totals
+
+    for item in itms:
+        if not isinstance(item, dict):
+            continue
+        itm_det = item.get("itm_det", {})
+        if not isinstance(itm_det, dict):
+            continue
+        for key in totals:
+            try:
+                totals[key] += float(itm_det.get(key, 0) or 0)
+            except Exception:
+                pass
+
+    return totals
+
+
+def find_invoice_like_dicts(
+    obj: Any,
+    section: str,
+    ancestors: Optional[List[Dict[str, Any]]] = None,
+    path: str = "",
+    out: Optional[List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]] = None,
+) -> List[Tuple[str, Dict[str, Any], List[Dict[str, Any]]]]:
+    """
+    Finds invoice/note-like dictionaries in GSTR-1 responses.
+    This makes the app useful even when different sections have slightly different schemas.
+    """
+    if ancestors is None:
+        ancestors = []
+    if out is None:
+        out = []
+
+    if isinstance(obj, dict):
+        keys = set(obj.keys())
+        invoice_markers = {"inum", "idt", "val", "inv_typ"}
+        note_markers = {"nt_num", "nt_dt", "ntty"}
+        doc_markers = {"doc_num", "from", "to", "totnum", "net_issue"}
+
+        is_invoice = bool(invoice_markers.intersection(keys)) and ("itms" in keys or "val" in keys or "inum" in keys)
+        is_note = bool(note_markers.intersection(keys))
+        is_doc = section == "DOC-ISSUE" and bool(doc_markers.intersection(keys))
+
+        if is_invoice or is_note or is_doc:
+            out.append((path, obj, ancestors.copy()))
+
+        new_ancestors = ancestors + [obj]
+        for key, value in obj.items():
+            find_invoice_like_dicts(value, section, new_ancestors, f"{path}.{key}" if path else str(key), out)
+
+    elif isinstance(obj, list):
+        for idx, item in enumerate(obj):
+            find_invoice_like_dicts(item, section, ancestors, f"{path}[{idx}]", out)
+
+    return out
+
+
+def extract_gstr1_invoice_rows(payload: Dict[str, Any], gstin: str, year: str, month: str, section: str) -> List[Dict[str, Any]]:
+    data = get_nested(payload, "data", "data", default={})
+    rows = []
+    found = find_invoice_like_dicts(data, section)
+
+    for path, doc, ancestors in found:
+        counterparty = ""
+        for anc in reversed(ancestors):
+            if isinstance(anc, dict) and anc.get("ctin"):
+                counterparty = str(anc.get("ctin"))
+                break
+
+        totals = sum_item_amounts(doc)
+        rows.append(
+            {
+                "GSTIN": gstin,
+                "Year": year,
+                "Month": month,
+                "Section": section,
+                "Counterparty GSTIN": counterparty,
+                "Invoice Number": doc.get("inum") or doc.get("nt_num") or doc.get("doc_num") or "",
+                "Invoice Date": doc.get("idt") or doc.get("nt_dt") or "",
+                "Invoice Value": doc.get("val") or "",
+                "Invoice Type": doc.get("inv_typ") or doc.get("ntty") or "",
+                "POS": doc.get("pos") or "",
+                "Reverse Charge": doc.get("rchrg") or "",
+                "Taxable Value": totals["txval"],
+                "IGST": totals["iamt"],
+                "CGST": totals["camt"],
+                "SGST": totals["samt"],
+                "CESS": totals["csamt"],
+                "Source Type": doc.get("srctyp") or "",
+                "Raw Path": path,
+            }
+        )
+
+    return rows
+
+
+def add_return_response(
+    gstin: str,
+    ret: str,
+    section: str,
+    year: str,
+    month: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    status, msg = response_status_message(payload)
+    return {
+        "GSTIN": gstin,
+        "Return": ret,
+        "Section": section,
+        "Year": year,
+        "Month": month,
+        "Status": status,
+        "Message": msg,
+        "Transaction ID": payload.get("transaction_id", ""),
+        "Fetched At": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "Raw JSON": json.dumps(payload, ensure_ascii=False),
+    }
+
+
+def make_return_facts(
+    gstin: str,
+    ret: str,
+    section: str,
+    year: str,
+    month: str,
+    payload: Dict[str, Any],
+) -> pd.DataFrame:
+    data = get_nested(payload, "data", "data", default=payload)
+    context = {
+        "GSTIN": gstin,
+        "Return": ret,
+        "Section": section,
+        "Year": year,
+        "Month": month,
+    }
+    rows = json_leaf_rows(data, context)
+    return pd.DataFrame(rows, columns=RETURN_FACT_COLUMNS)
+
+
+# ============================================================
 # Input / Export
 # ============================================================
 def read_uploaded_gstins(uploaded_file) -> pd.DataFrame:
     name = uploaded_file.name.lower()
 
     if name.endswith(".csv"):
-        df = pd.read_csv(uploaded_file, dtype=str)
-    elif name.endswith((".xlsx", ".xls")):
-        df = pd.read_excel(uploaded_file, dtype=str)
-    else:
-        raise ValueError("Upload only CSV or Excel.")
+        return pd.read_csv(uploaded_file, dtype=str)
+    if name.endswith((".xlsx", ".xls")):
+        return pd.read_excel(uploaded_file, dtype=str)
 
-    return df
+    raise ValueError("Upload only CSV or Excel.")
 
 
 def sample_template() -> bytes:
@@ -492,15 +889,32 @@ def sample_template() -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
 
-def make_excel(customers: pd.DataFrame, filings: pd.DataFrame, errors: pd.DataFrame) -> bytes:
+def make_excel(
+    customers: pd.DataFrame,
+    filings: pd.DataFrame,
+    errors: pd.DataFrame,
+    return_responses: Optional[pd.DataFrame] = None,
+    return_facts: Optional[pd.DataFrame] = None,
+    gstr1_invoices: Optional[pd.DataFrame] = None,
+) -> bytes:
     output = BytesIO()
+
+    if return_responses is None:
+        return_responses = pd.DataFrame(columns=RETURN_RESPONSE_COLUMNS)
+    if return_facts is None:
+        return_facts = pd.DataFrame(columns=RETURN_FACT_COLUMNS)
+    if gstr1_invoices is None:
+        gstr1_invoices = pd.DataFrame(columns=GSTR1_INVOICE_COLUMNS)
 
     summary = pd.DataFrame(
         [
             {"Metric": "Total GSTINs", "Value": len(customers)},
             {"Metric": "Successful / Partial Rows", "Value": int(customers["API Status"].str.contains("OK|Profile OK|Completed", case=False, na=False).sum()) if not customers.empty else 0},
             {"Metric": "Active GSTINs", "Value": int(customers["GSTIN / UIN Status"].str.contains("Active", case=False, na=False).sum()) if not customers.empty else 0},
-            {"Metric": "Filing Rows", "Value": len(filings)},
+            {"Metric": "Public Filing Rows", "Value": len(filings)},
+            {"Metric": "Private Return Responses", "Value": len(return_responses)},
+            {"Metric": "GSTR-1 Invoice Rows", "Value": len(gstr1_invoices)},
+            {"Metric": "Return Fact Rows", "Value": len(return_facts)},
             {"Metric": "Error Rows", "Value": len(errors)},
         ]
     )
@@ -508,38 +922,64 @@ def make_excel(customers: pd.DataFrame, filings: pd.DataFrame, errors: pd.DataFr
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
         summary.to_excel(writer, index=False, sheet_name="Summary")
         customers.to_excel(writer, index=False, sheet_name="Taxpayer Details")
-        filings.to_excel(writer, index=False, sheet_name="Filing Table")
+        filings.to_excel(writer, index=False, sheet_name="Public Filing Table")
+        gstr1_invoices.to_excel(writer, index=False, sheet_name="GSTR1 Invoice Rows")
+        return_facts.to_excel(writer, index=False, sheet_name="Return Facts")
+        return_responses.to_excel(writer, index=False, sheet_name="Raw Return JSON")
         errors.to_excel(writer, index=False, sheet_name="Errors")
 
     return output.getvalue()
 
 
+def append_df(existing: pd.DataFrame, incoming: pd.DataFrame, columns: List[str]) -> pd.DataFrame:
+    if incoming.empty:
+        return existing.reindex(columns=columns)
+    combined = pd.concat([existing.reindex(columns=columns), incoming.reindex(columns=columns)], ignore_index=True)
+    return combined.reindex(columns=columns)
+
+
+def init_state() -> None:
+    defaults = {
+        "gstin_list": [],
+        "customers_df": pd.DataFrame(columns=CUSTOMER_COLUMNS),
+        "filings_df": pd.DataFrame(columns=FILING_COLUMNS),
+        "errors_df": pd.DataFrame(columns=ERROR_COLUMNS),
+        "taxpayer_sessions": {},
+        "return_responses_df": pd.DataFrame(columns=RETURN_RESPONSE_COLUMNS),
+        "return_facts_df": pd.DataFrame(columns=RETURN_FACT_COLUMNS),
+        "gstr1_invoices_df": pd.DataFrame(columns=GSTR1_INVOICE_COLUMNS),
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+
 # ============================================================
 # Streamlit UI
 # ============================================================
+init_state()
+
 st.set_page_config(
-    page_title="Bulk GSTIN API Lookup",
+    page_title="Bulk GSTIN API + GSTR Reports",
     page_icon="🧾",
     layout="wide",
 )
 
-st.title("🧾 Bulk GSTIN API Lookup")
-st.caption("Fetch Legal Name, Trade Name, Constitution, Status, Filing Table, and Filing Frequency for multiple GSTINs in one go.")
+st.title("🧾 Bulk GSTIN API Lookup + GSTR-1 / GSTR-3B Data")
+st.caption("Public filing status remains unchanged. New taxpayer-auth module can pull GSTR-1/GSTR-3B data after OTP authorization.")
 
-with st.expander("Which login/credentials should I use?", expanded=True):
+with st.expander("Important: what credentials are needed?", expanded=True):
     st.markdown(
         """
-        **Use API provider credentials, not your normal GST portal login.**
+        **Public data already working:** only Sandbox API Key + API Secret are needed.
 
-        For public GSTIN lookup, return tracking, and return preference, this app needs:
-        - `SANDBOX_API_KEY`
-        - `SANDBOX_API_SECRET`
+        **GSTR-1 / GSTR-3B detailed data:** requires taxpayer OTP authorization for that GSTIN. Do **not** collect GST portal password. Use:
+        - Sandbox API Key + API Secret
+        - Customer GSTIN
+        - Customer GST portal username
+        - OTP sent to the customer/authorized user's registered mobile/email
 
-        You get these from your API provider console, for example Sandbox Console → Settings → API Keys.
-
-        Your **GST portal username/password is not required** for this public lookup app.
-
-        GST portal taxpayer login / OTP consent is needed only for taxpayer-private APIs like downloading GSTR-2A/2B, ledgers, filing returns, etc.
+        The taxpayer session is stored only in this app session memory and may expire.
         """
     )
 
@@ -551,25 +991,16 @@ with st.sidebar:
         "Environment",
         ["production", "test"],
         index=0 if env_default == "production" else 1,
-        help="Use production for live data and test for Sandbox test environment.",
     )
     base_url = get_base_url(env)
 
-    api_key = st.text_input(
-        "Sandbox API Key",
-        value=os.getenv("SANDBOX_API_KEY", ""),
-        type="password",
-    )
-    api_secret = st.text_input(
-        "Sandbox API Secret",
-        value=os.getenv("SANDBOX_API_SECRET", ""),
-        type="password",
-    )
+    api_key = st.text_input("Sandbox API Key", value=os.getenv("SANDBOX_API_KEY", ""), type="password")
+    api_secret = st.text_input("Sandbox API Secret", value=os.getenv("SANDBOX_API_SECRET", ""), type="password")
 
-    financial_year = st.text_input("Financial Year", value="FY 2025-26", help="Example: FY 2025-26")
+    financial_year = st.text_input("Financial Year for public filing status", value="FY 2026-27", help="Example: FY 2026-27")
 
     fetch_profile = st.checkbox("Fetch Taxpayer Profile", value=True)
-    fetch_filings = st.checkbox("Fetch Filing Table", value=True)
+    fetch_filings = st.checkbox("Fetch Public Filing Table", value=True)
     fetch_preference = st.checkbox("Fetch Filing Frequency", value=True)
     accept_cache = st.checkbox("Accept Cached API Response", value=True)
     delay_seconds = st.number_input("Delay between GSTIN calls (seconds)", min_value=0.0, max_value=10.0, value=0.3, step=0.1)
@@ -588,8 +1019,19 @@ with st.sidebar:
         except Exception as exc:
             st.error(f"Authentication failed: {exc}")
 
-tab_input, tab_run, tab_results = st.tabs(["1. Input GSTINs", "2. Run API", "3. Results & Export"])
+tab_input, tab_run, tab_results, tab_auth, tab_reports = st.tabs(
+    [
+        "1. Input GSTINs",
+        "2. Run Public API",
+        "3. Results & Export",
+        "4. Taxpayer OTP Auth",
+        "5. Pull GSTR-1 / GSTR-3B",
+    ]
+)
 
+# ------------------------------------------------------------
+# Tab 1: Input GSTINs
+# ------------------------------------------------------------
 with tab_input:
     st.subheader("Input Multiple GSTINs")
 
@@ -651,8 +1093,11 @@ with tab_input:
         st.dataframe(preview_df, use_container_width=True)
         st.session_state["gstin_list"] = gstin_list
 
+# ------------------------------------------------------------
+# Tab 2: Run Public API
+# ------------------------------------------------------------
 with tab_run:
-    st.subheader("Run Bulk API Lookup")
+    st.subheader("Run Bulk Public API Lookup")
 
     gstin_list = st.session_state.get("gstin_list", [])
 
@@ -663,7 +1108,7 @@ with tab_run:
     else:
         st.write(f"Ready to process **{len(gstin_list)} GSTINs** for **{financial_year}**.")
 
-        if st.button("Start Bulk API Lookup", type="primary"):
+        if st.button("Start Bulk Public API Lookup", type="primary"):
             progress = st.progress(0)
             status_box = st.empty()
 
@@ -707,35 +1152,54 @@ with tab_run:
             st.session_state["filings_df"] = pd.DataFrame(filing_rows_all, columns=FILING_COLUMNS)
             st.session_state["errors_df"] = pd.DataFrame(error_rows_all, columns=ERROR_COLUMNS)
 
-            status_box.success("Bulk API lookup completed.")
+            status_box.success("Bulk public API lookup completed.")
 
+# ------------------------------------------------------------
+# Tab 3: Results & Export
+# ------------------------------------------------------------
 with tab_results:
     st.subheader("Results & Export")
 
     customers = st.session_state.get("customers_df", pd.DataFrame(columns=CUSTOMER_COLUMNS))
     filings = st.session_state.get("filings_df", pd.DataFrame(columns=FILING_COLUMNS))
     errors = st.session_state.get("errors_df", pd.DataFrame(columns=ERROR_COLUMNS))
+    return_responses = st.session_state.get("return_responses_df", pd.DataFrame(columns=RETURN_RESPONSE_COLUMNS))
+    return_facts = st.session_state.get("return_facts_df", pd.DataFrame(columns=RETURN_FACT_COLUMNS))
+    gstr1_invoices = st.session_state.get("gstr1_invoices_df", pd.DataFrame(columns=GSTR1_INVOICE_COLUMNS))
 
     if customers.empty:
-        st.info("No results yet. Run the API lookup first.")
+        st.info("No public results yet. Run the public API lookup first.")
     else:
-        m1, m2, m3, m4 = st.columns(4)
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("GSTINs Processed", len(customers))
         m2.metric("Active GSTINs", int(customers["GSTIN / UIN Status"].str.contains("Active", case=False, na=False).sum()))
-        m3.metric("Filing Rows", len(filings))
-        m4.metric("Errors", len(errors))
+        m3.metric("Public Filing Rows", len(filings))
+        m4.metric("Private Return Responses", len(return_responses))
+        m5.metric("Errors", len(errors))
 
         st.write("### Taxpayer Details")
         st.dataframe(customers, use_container_width=True)
 
-        st.write("### Filing Table in Detail")
+        st.write("### Public Filing Table in Detail")
         st.dataframe(filings, use_container_width=True)
+
+        if not gstr1_invoices.empty:
+            st.write("### GSTR-1 Invoice Rows")
+            st.dataframe(gstr1_invoices, use_container_width=True)
+
+        if not return_facts.empty:
+            st.write("### Return Fact Rows")
+            st.dataframe(return_facts, use_container_width=True)
+
+        if not return_responses.empty:
+            st.write("### Raw Return API Responses")
+            st.dataframe(return_responses.drop(columns=["Raw JSON"], errors="ignore"), use_container_width=True)
 
         if not errors.empty:
             st.write("### Errors / Failed GSTINs")
             st.dataframe(errors, use_container_width=True)
 
-        excel_bytes = make_excel(customers, filings, errors)
+        excel_bytes = make_excel(customers, filings, errors, return_responses, return_facts, gstr1_invoices)
         stamp = datetime.now().strftime("%Y%m%d_%H%M")
 
         col_a, col_b, col_c = st.columns(3)
@@ -743,21 +1207,280 @@ with tab_results:
             st.download_button(
                 "Download Full Excel Report",
                 data=excel_bytes,
-                file_name=f"bulk_gstin_api_report_{stamp}.xlsx",
+                file_name=f"bulk_gstin_gstr_report_{stamp}.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                 type="primary",
             )
         with col_b:
             st.download_button(
-                "Download Taxpayer Details CSV",
+                "Download Public Taxpayer CSV",
                 data=customers.to_csv(index=False).encode("utf-8"),
                 file_name=f"taxpayer_details_{stamp}.csv",
                 mime="text/csv",
             )
         with col_c:
             st.download_button(
-                "Download Filing Table CSV",
+                "Download Public Filing CSV",
                 data=filings.to_csv(index=False).encode("utf-8"),
                 file_name=f"filing_table_{stamp}.csv",
                 mime="text/csv",
+            )
+
+# ------------------------------------------------------------
+# Tab 4: Taxpayer OTP Auth
+# ------------------------------------------------------------
+with tab_auth:
+    st.subheader("Taxpayer OTP Authentication")
+    st.warning(
+        "This step is required only for private GSTR-1/GSTR-3B data. "
+        "Do not ask for or store the customer's GST portal password."
+    )
+
+    customers = st.session_state.get("customers_df", pd.DataFrame(columns=CUSTOMER_COLUMNS))
+    gstin_options = sorted(set(st.session_state.get("gstin_list", [])) | set(customers["GSTIN"].dropna().tolist() if not customers.empty else []))
+
+    if not gstin_options:
+        manual_gstin = st.text_input("GSTIN", placeholder="Enter GSTIN")
+        auth_gstin = clean_gstin(manual_gstin)
+    else:
+        auth_gstin = st.selectbox("Select GSTIN", gstin_options)
+
+    username = st.text_input("GST Portal Username for this GSTIN", placeholder="Customer GST portal username, not password")
+    st.caption("Customer should enable API access on GST portal before OTP, otherwise OTP/API session may fail.")
+
+    if st.button("Generate Taxpayer OTP", type="primary"):
+        if not api_key or not api_secret:
+            st.error("Enter Sandbox API Key and API Secret first.")
+        elif not auth_gstin or not username:
+            st.error("Enter GSTIN and GST portal username.")
+        else:
+            try:
+                app_token = authenticate(api_key, api_secret, base_url)
+                payload = generate_taxpayer_otp(base_url, api_key, app_token, auth_gstin, username)
+                st.session_state["pending_taxpayer_auth"] = {
+                    "gstin": auth_gstin,
+                    "username": username,
+                    "app_token": app_token,
+                    "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "response": payload,
+                }
+                st.success("OTP request sent. Ask the customer/authorized user for the OTP received on registered mobile/email.")
+                st.json(payload)
+            except Exception as exc:
+                st.error(f"OTP generation failed: {exc}")
+
+    pending = st.session_state.get("pending_taxpayer_auth", {})
+    if pending:
+        st.write("### Verify OTP")
+        st.write(f"Pending GSTIN: **{pending.get('gstin')}**")
+        st.write(f"Username: **{pending.get('username')}**")
+        otp = st.text_input("Enter OTP", type="password")
+
+        if st.button("Verify OTP and Start Taxpayer Session"):
+            try:
+                payload = verify_taxpayer_otp(
+                    base_url,
+                    api_key,
+                    pending["app_token"],
+                    pending["gstin"],
+                    pending["username"],
+                    otp,
+                )
+                taxpayer_token = get_nested(payload, "data", "access_token")
+                session_expiry = get_nested(payload, "data", "session_expiry", default="")
+                if not taxpayer_token:
+                    st.error("OTP verified response did not contain taxpayer access_token.")
+                    st.json(payload)
+                else:
+                    sessions = st.session_state.get("taxpayer_sessions", {})
+                    sessions[pending["gstin"]] = {
+                        "gstin": pending["gstin"],
+                        "username": pending["username"],
+                        "taxpayer_token": taxpayer_token,
+                        "session_expiry": session_expiry,
+                        "verified_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    st.session_state["taxpayer_sessions"] = sessions
+                    st.success("Taxpayer session started. You can now pull GSTR-1/GSTR-3B data.")
+                    st.json({k: v for k, v in payload.items() if k != "data"})
+            except Exception as exc:
+                st.error(f"OTP verification failed: {exc}")
+
+    sessions = st.session_state.get("taxpayer_sessions", {})
+    if sessions:
+        st.write("### Active Taxpayer Sessions in this Streamlit run")
+        session_preview = pd.DataFrame(
+            [
+                {
+                    "GSTIN": k,
+                    "Username": v.get("username", ""),
+                    "Verified At": v.get("verified_at", ""),
+                    "Session Expiry": v.get("session_expiry", ""),
+                }
+                for k, v in sessions.items()
+            ]
+        )
+        st.dataframe(session_preview, use_container_width=True)
+
+# ------------------------------------------------------------
+# Tab 5: Pull GSTR-1 / GSTR-3B
+# ------------------------------------------------------------
+with tab_reports:
+    st.subheader("Pull GSTR-1 / GSTR-3B Data")
+
+    sessions = st.session_state.get("taxpayer_sessions", {})
+    filings = st.session_state.get("filings_df", pd.DataFrame(columns=FILING_COLUMNS))
+
+    if not sessions:
+        st.info("First complete Taxpayer OTP Auth for at least one GSTIN.")
+    else:
+        session_gstins = sorted(sessions.keys())
+        selected_gstin = st.selectbox("Select authenticated GSTIN", session_gstins)
+
+        gstin_filings = filings[filings["GSTIN"] == selected_gstin] if not filings.empty else pd.DataFrame(columns=FILING_COLUMNS)
+
+        period_options = []
+        period_map = {}
+
+        if not gstin_filings.empty:
+            for _, row in gstin_filings.iterrows():
+                ret_period = str(row.get("Return Period", ""))
+                year, month = parse_period_to_year_month(ret_period)
+                label = f"{row.get('Return Type', '')} | {ret_period} | Filed {row.get('Date of Filing', '')} | ARN {row.get('ARN', '')}"
+                if year and month:
+                    period_options.append(label)
+                    period_map[label] = (year, month)
+
+        use_from_filing = st.checkbox("Select period from public filing table", value=bool(period_options))
+
+        if use_from_filing and period_options:
+            selected_period = st.selectbox("Select filed return period", period_options)
+            year, month = period_map[selected_period]
+            st.success(f"Selected API period: Year {year}, Month {month}")
+        else:
+            c1, c2 = st.columns(2)
+            with c1:
+                year = st.text_input("Year", value=str(datetime.now().year))
+            with c2:
+                month = st.text_input("Month", value=f"{datetime.now().month:02d}", help="Use 01 to 12")
+
+        st.write("### What to fetch")
+        fetch_gstr3b = st.checkbox("Fetch GSTR-3B Details", value=True)
+        fetch_gstr1 = st.checkbox("Fetch GSTR-1 Documents", value=True)
+
+        selected_sections = []
+        if fetch_gstr1:
+            selected_sections = st.multiselect(
+                "GSTR-1 Sections",
+                options=list(GSTR1_SECTIONS.keys()),
+                default=["B2B", "B2CL", "B2CS", "CDNR", "CDNUR", "EXP", "NIL", "HSN", "DOC-ISSUE"],
+            )
+
+        if st.button("Pull Return Data", type="primary"):
+            if not re.match(r"^\d{4}$", str(year)):
+                st.error("Year must be YYYY, example 2026.")
+                st.stop()
+            if not re.match(r"^(0[1-9]|1[0-2])$", str(month)):
+                st.error("Month must be 01 to 12.")
+                st.stop()
+
+            taxpayer_token = sessions[selected_gstin]["taxpayer_token"]
+            response_rows: List[Dict[str, Any]] = []
+            fact_frames: List[pd.DataFrame] = []
+            invoice_rows: List[Dict[str, Any]] = []
+            error_rows: List[Dict[str, Any]] = []
+
+            progress_steps = (1 if fetch_gstr3b else 0) + (len(selected_sections) if fetch_gstr1 else 0)
+            progress_steps = max(progress_steps, 1)
+            progress = st.progress(0)
+            done = 0
+
+            if fetch_gstr3b:
+                try:
+                    payload = fetch_gstr3b_details(base_url, api_key, taxpayer_token, year, month)
+                    response_rows.append(add_return_response(selected_gstin, "GSTR-3B", "DETAILS", year, month, payload))
+                    fact_frames.append(make_return_facts(selected_gstin, "GSTR-3B", "DETAILS", year, month, payload))
+                    st.success("Fetched GSTR-3B details.")
+                except Exception as exc:
+                    error_rows.append(build_error(selected_gstin, "GSTR-3B Details", str(exc)))
+                    st.error(f"GSTR-3B fetch failed: {exc}")
+                done += 1
+                progress.progress(done / progress_steps)
+
+            if fetch_gstr1:
+                for section in selected_sections:
+                    slug = GSTR1_SECTIONS[section]
+                    try:
+                        payload = fetch_gstr1_section(base_url, api_key, taxpayer_token, slug, year, month)
+                        response_rows.append(add_return_response(selected_gstin, "GSTR-1", section, year, month, payload))
+                        fact_frames.append(make_return_facts(selected_gstin, "GSTR-1", section, year, month, payload))
+                        invoice_rows.extend(extract_gstr1_invoice_rows(payload, selected_gstin, year, month, section))
+                        st.success(f"Fetched GSTR-1 {section}.")
+                    except Exception as exc:
+                        error_rows.append(build_error(selected_gstin, f"GSTR-1 {section}", str(exc)))
+                        st.error(f"GSTR-1 {section} fetch failed: {exc}")
+                    done += 1
+                    progress.progress(done / progress_steps)
+
+            new_responses = pd.DataFrame(response_rows, columns=RETURN_RESPONSE_COLUMNS)
+            new_facts = pd.concat(fact_frames, ignore_index=True) if fact_frames else pd.DataFrame(columns=RETURN_FACT_COLUMNS)
+            new_invoices = pd.DataFrame(invoice_rows, columns=GSTR1_INVOICE_COLUMNS)
+            new_errors = pd.DataFrame(error_rows, columns=ERROR_COLUMNS)
+
+            st.session_state["return_responses_df"] = append_df(
+                st.session_state.get("return_responses_df", pd.DataFrame(columns=RETURN_RESPONSE_COLUMNS)),
+                new_responses,
+                RETURN_RESPONSE_COLUMNS,
+            )
+            st.session_state["return_facts_df"] = append_df(
+                st.session_state.get("return_facts_df", pd.DataFrame(columns=RETURN_FACT_COLUMNS)),
+                new_facts,
+                RETURN_FACT_COLUMNS,
+            )
+            st.session_state["gstr1_invoices_df"] = append_df(
+                st.session_state.get("gstr1_invoices_df", pd.DataFrame(columns=GSTR1_INVOICE_COLUMNS)),
+                new_invoices,
+                GSTR1_INVOICE_COLUMNS,
+            )
+            st.session_state["errors_df"] = append_df(
+                st.session_state.get("errors_df", pd.DataFrame(columns=ERROR_COLUMNS)),
+                new_errors,
+                ERROR_COLUMNS,
+            )
+
+            st.success("Return data pull completed.")
+
+        st.write("### Pulled Return Data Preview")
+        return_responses = st.session_state.get("return_responses_df", pd.DataFrame(columns=RETURN_RESPONSE_COLUMNS))
+        return_facts = st.session_state.get("return_facts_df", pd.DataFrame(columns=RETURN_FACT_COLUMNS))
+        gstr1_invoices = st.session_state.get("gstr1_invoices_df", pd.DataFrame(columns=GSTR1_INVOICE_COLUMNS))
+
+        if not return_responses.empty:
+            st.write("#### API Response Summary")
+            st.dataframe(return_responses.drop(columns=["Raw JSON"], errors="ignore"), use_container_width=True)
+
+        if not gstr1_invoices.empty:
+            st.write("#### GSTR-1 Invoice Rows")
+            st.dataframe(gstr1_invoices, use_container_width=True)
+
+        if not return_facts.empty:
+            st.write("#### Generic Return Facts")
+            st.dataframe(return_facts, use_container_width=True)
+
+        if not return_responses.empty:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M")
+            export_excel = make_excel(
+                st.session_state.get("customers_df", pd.DataFrame(columns=CUSTOMER_COLUMNS)),
+                st.session_state.get("filings_df", pd.DataFrame(columns=FILING_COLUMNS)),
+                st.session_state.get("errors_df", pd.DataFrame(columns=ERROR_COLUMNS)),
+                return_responses,
+                return_facts,
+                gstr1_invoices,
+            )
+            st.download_button(
+                "Download Return Data Excel",
+                data=export_excel,
+                file_name=f"gstr1_gstr3b_data_{selected_gstin}_{stamp}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary",
             )
