@@ -120,6 +120,9 @@ CUSTOMER_COLUMNS = [
     "Aggregate Turnover FY",
     "Gross Total Income",
     "Gross Total Income FY",
+    "Turnover Data Status",
+    "Detected Turnover/E-Invoice Keys",
+    "Raw GSTIN Profile JSON",
     "Nature of Business",
     "Principal Place State",
     "Principal Place City",
@@ -455,6 +458,40 @@ def find_first_profile_value(data: Any, candidate_keys: List[str]) -> str:
     return scan(data)
 
 
+
+
+def find_keyword_paths(data: Any, keywords: List[str], max_items: int = 30) -> str:
+    """
+    Returns key paths containing keywords such as turnover, aato, gross, income, einvoice.
+    Useful to confirm whether the API response actually contains turnover-related data.
+    """
+    matches: List[str] = []
+    keywords_lower = [k.lower() for k in keywords]
+
+    def walk(obj: Any, path: str = "") -> None:
+        if len(matches) >= max_items:
+            return
+
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                key_text = str(key)
+                new_path = f"{path}.{key_text}" if path else key_text
+                if any(keyword in new_path.lower() for keyword in keywords_lower):
+                    if isinstance(value, (dict, list)):
+                        value_text = json.dumps(value, ensure_ascii=False)[:250]
+                    else:
+                        value_text = str(value)
+                    matches.append(f"{new_path} = {value_text}")
+
+                walk(value, new_path)
+
+        elif isinstance(obj, list):
+            for idx, value in enumerate(obj):
+                walk(value, f"{path}[{idx}]")
+
+    walk(data)
+    return " | ".join(matches)
+
 def extract_business_data(search_payload: Dict[str, Any]) -> Dict[str, Any]:
     data = get_nested(search_payload, "data", "data", default={})
     if not isinstance(data, dict):
@@ -470,6 +507,81 @@ def extract_business_data(search_payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         nature_of_business = str(nba or "")
 
+    e_invoice_status = find_first_profile_value(
+        data,
+        [
+            "einvoiceStatus",
+            "eInvoiceStatus",
+            "einvStatus",
+            "einv_applicable",
+            "isEinvoiceApplicable",
+        ],
+    )
+    aggregate_turnover = find_first_profile_value(
+        data,
+        [
+            "aggreTurnOver",
+            "aggreTurnover",
+            "aggre_turnover",
+            "aggregateTurnover",
+            "aggregate_turnover",
+            "aggTurnOver",
+            "aato",
+            "AATO",
+            "annualAggregateTurnover",
+            "annual_aggregate_turnover",
+        ],
+    )
+    aggregate_turnover_fy = find_first_profile_value(
+        data,
+        [
+            "aggreTurnOverFY",
+            "aggreTurnOverFy",
+            "aggre_turnover_fy",
+            "aggregateTurnoverFY",
+            "aggregateTurnoverFy",
+            "aggregate_turnover_fy",
+            "aatoFinancialYear",
+            "aatoFY",
+            "AATOFY",
+            "annualAggregateTurnoverFY",
+            "annual_aggregate_turnover_fy",
+        ],
+    )
+    gross_total_income = find_first_profile_value(
+        data,
+        [
+            "grossTotalIncome",
+            "gross_total_income",
+            "gti",
+            "GTI",
+            "grossIncome",
+            "gross_income",
+        ],
+    )
+    gross_total_income_fy = find_first_profile_value(
+        data,
+        [
+            "grossTotalIncomeFY",
+            "grossTotalIncomeFy",
+            "grossTotalIncomeFinancialYear",
+            "gross_total_income_fy",
+            "gtiFinancialYear",
+            "gtiFY",
+            "grossIncomeFY",
+        ],
+    )
+
+    detected_keys = find_keyword_paths(
+        data,
+        ["turnover", "turn", "aato", "gross", "income", "gti", "einvoice", "e-invoice"],
+    )
+    turnover_found = any(
+        str(value).strip()
+        for value in [aggregate_turnover, aggregate_turnover_fy, gross_total_income, gross_total_income_fy]
+    )
+    turnover_status = "Found in API response" if turnover_found else "Not returned by this API response"
+
     return {
         "Legal Name of Business": data.get("lgnm", ""),
         "Trade Name": data.get("tradeNam", ""),
@@ -479,61 +591,14 @@ def extract_business_data(search_payload: Dict[str, Any]) -> Dict[str, Any]:
         "Registration Date": data.get("rgdt", ""),
         "Cancellation Date": data.get("cxdt", ""),
         "Last Updated on GSTN": data.get("lstupdt", ""),
-        "E-Invoice Status": find_first_profile_value(
-            data,
-            [
-                "einvoiceStatus",
-                "eInvoiceStatus",
-                "einvStatus",
-                "einv_applicable",
-                "isEinvoiceApplicable",
-            ],
-        ),
-        "Aggregate Turnover": find_first_profile_value(
-            data,
-            [
-                "aggreTurnOver",
-                "aggreTurnover",
-                "aggregateTurnover",
-                "aggregate_turnover",
-                "aggTurnOver",
-                "aato",
-                "AATO",
-            ],
-        ),
-        "Aggregate Turnover FY": find_first_profile_value(
-            data,
-            [
-                "aggreTurnOverFY",
-                "aggreTurnOverFy",
-                "aggregateTurnoverFY",
-                "aggregateTurnoverFy",
-                "aggregate_turnover_fy",
-                "aatoFinancialYear",
-                "aatoFY",
-                "AATOFY",
-            ],
-        ),
-        "Gross Total Income": find_first_profile_value(
-            data,
-            [
-                "grossTotalIncome",
-                "gross_total_income",
-                "gti",
-                "GTI",
-            ],
-        ),
-        "Gross Total Income FY": find_first_profile_value(
-            data,
-            [
-                "grossTotalIncomeFY",
-                "grossTotalIncomeFy",
-                "grossTotalIncomeFinancialYear",
-                "gross_total_income_fy",
-                "gtiFinancialYear",
-                "gtiFY",
-            ],
-        ),
+        "E-Invoice Status": e_invoice_status,
+        "Aggregate Turnover": aggregate_turnover,
+        "Aggregate Turnover FY": aggregate_turnover_fy,
+        "Gross Total Income": gross_total_income,
+        "Gross Total Income FY": gross_total_income_fy,
+        "Turnover Data Status": turnover_status,
+        "Detected Turnover/E-Invoice Keys": detected_keys,
+        "Raw GSTIN Profile JSON": json.dumps(data, ensure_ascii=False)[:15000],
         "Nature of Business": nature_of_business,
         "Principal Place State": addr.get("stcd", ""),
         "Principal Place City": addr.get("loc", "") or addr.get("dst", ""),
@@ -638,6 +703,9 @@ def fetch_one_gstin(
         "Aggregate Turnover FY": "",
         "Gross Total Income": "",
         "Gross Total Income FY": "",
+        "Turnover Data Status": "",
+        "Detected Turnover/E-Invoice Keys": "",
+        "Raw GSTIN Profile JSON": "",
         "Nature of Business": "",
         "Principal Place State": "",
         "Principal Place City": "",
@@ -1355,11 +1423,26 @@ with tab_results:
             "Gross Total Income",
             "Gross Total Income FY",
             "E-Invoice Status",
+            "Turnover Data Status",
             "Filing Frequency",
             "GSTIN / UIN Status",
         ]
         existing_turnover_cols = [col for col in turnover_cols if col in customers.columns]
         st.dataframe(customers[existing_turnover_cols], use_container_width=True)
+
+        with st.expander("Debug: why turnover may be blank"):
+            st.write(
+                "If Aggregate Turnover / Gross Total Income is blank, the API response did not include these fields for that GSTIN. "
+                "This section shows detected related keys and raw GSTIN profile JSON for checking exact API keys."
+            )
+            debug_cols = [
+                "GSTIN",
+                "Turnover Data Status",
+                "Detected Turnover/E-Invoice Keys",
+                "Raw GSTIN Profile JSON",
+            ]
+            existing_debug_cols = [col for col in debug_cols if col in customers.columns]
+            st.dataframe(customers[existing_debug_cols], use_container_width=True)
 
         st.write("### Public Filing Table in Detail")
         st.dataframe(filings, use_container_width=True)
