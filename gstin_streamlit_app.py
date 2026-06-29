@@ -19,8 +19,11 @@ def validate_gstin(gstin):
 def fetch_captcha(session):
     captcha_page = session.get(GST_PORTAL_URL)
     soup = BeautifulSoup(captcha_page.text, "html.parser")
-    captcha_img_tag = soup.find("img", {"id": "captchaImg"})
-    if captcha_img_tag:
+    # Try multiple ways to locate captcha image
+    captcha_img_tag = soup.find("img", {"id": "captchaImg"}) \
+                      or soup.find("img", {"class": "captcha-img"}) \
+                      or soup.find("img", {"alt": "Captcha"})
+    if captcha_img_tag and "src" in captcha_img_tag.attrs:
         captcha_url = "https://services.gst.gov.in" + captcha_img_tag["src"]
         return captcha_url
     return None
@@ -80,18 +83,18 @@ if gstin:
                     st.error(result["Error"])
                 else:
                     st.subheader("Taxpayer Details")
-                    st.write("**Legal Name:**", result["Legal Name"])
-                    st.write("**Trade Name:**", result["Trade Name"])
-                    st.write("**Status:**", result["Status"])
-                    st.write("**Filing Frequency:**", result["Filing Frequency"])
+                    st.write("**Legal Name:**", result.get("Legal Name", "N/A"))
+                    st.write("**Trade Name:**", result.get("Trade Name", "N/A"))
+                    st.write("**Status:**", result.get("Status", "N/A"))
+                    st.write("**Filing Frequency:**", result.get("Filing Frequency", "N/A"))
                     
-                    if result["Filing Table"]:
+                    if result.get("Filing Table"):
                         df = pd.DataFrame(result["Filing Table"], columns=["Period", "Return Type", "Status"])
                         st.dataframe(df)
-                        
                         st.download_button("Download as Excel", df.to_csv(index=False).encode("utf-8"), "filing_table.csv")
                         st.download_button("Download as PDF", df.to_string().encode("utf-8"), "filing_table.pdf")
         else:
-            st.error("Could not fetch captcha. GST portal may have changed.")
+            st.error("Could not fetch captcha. GST portal HTML may have changed.")
+            st.info("Tip: Inspect the GST portal manually and update the selector in fetch_captcha().")
     else:
         st.error("Invalid GSTIN format. Please check again.")
