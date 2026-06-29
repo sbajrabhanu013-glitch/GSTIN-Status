@@ -116,6 +116,10 @@ CUSTOMER_COLUMNS = [
     "Cancellation Date",
     "Last Updated on GSTN",
     "E-Invoice Status",
+    "Aggregate Turnover",
+    "Aggregate Turnover FY",
+    "Gross Total Income",
+    "Gross Total Income FY",
     "Nature of Business",
     "Principal Place State",
     "Principal Place City",
@@ -415,6 +419,42 @@ def taxpayer_get_api(
 # ============================================================
 # Public GSTIN APIs
 # ============================================================
+def find_first_profile_value(data: Any, candidate_keys: List[str]) -> str:
+    """
+    GST API providers sometimes change key names or nest turnover fields.
+    This helper checks common candidate keys, first at root level and then recursively.
+    """
+    if not isinstance(data, (dict, list)):
+        return ""
+
+    candidates_lower = {key.lower(): key for key in candidate_keys}
+
+    def scan(obj: Any) -> str:
+        if isinstance(obj, dict):
+            # First check direct key matches
+            for key, value in obj.items():
+                if str(key).lower() in candidates_lower and value not in [None, ""]:
+                    if isinstance(value, (dict, list)):
+                        return json.dumps(value, ensure_ascii=False)
+                    return str(value)
+
+            # Then scan nested objects
+            for value in obj.values():
+                found = scan(value)
+                if found:
+                    return found
+
+        elif isinstance(obj, list):
+            for value in obj:
+                found = scan(value)
+                if found:
+                    return found
+
+        return ""
+
+    return scan(data)
+
+
 def extract_business_data(search_payload: Dict[str, Any]) -> Dict[str, Any]:
     data = get_nested(search_payload, "data", "data", default={})
     if not isinstance(data, dict):
@@ -439,7 +479,61 @@ def extract_business_data(search_payload: Dict[str, Any]) -> Dict[str, Any]:
         "Registration Date": data.get("rgdt", ""),
         "Cancellation Date": data.get("cxdt", ""),
         "Last Updated on GSTN": data.get("lstupdt", ""),
-        "E-Invoice Status": data.get("einvoiceStatus", ""),
+        "E-Invoice Status": find_first_profile_value(
+            data,
+            [
+                "einvoiceStatus",
+                "eInvoiceStatus",
+                "einvStatus",
+                "einv_applicable",
+                "isEinvoiceApplicable",
+            ],
+        ),
+        "Aggregate Turnover": find_first_profile_value(
+            data,
+            [
+                "aggreTurnOver",
+                "aggreTurnover",
+                "aggregateTurnover",
+                "aggregate_turnover",
+                "aggTurnOver",
+                "aato",
+                "AATO",
+            ],
+        ),
+        "Aggregate Turnover FY": find_first_profile_value(
+            data,
+            [
+                "aggreTurnOverFY",
+                "aggreTurnOverFy",
+                "aggregateTurnoverFY",
+                "aggregateTurnoverFy",
+                "aggregate_turnover_fy",
+                "aatoFinancialYear",
+                "aatoFY",
+                "AATOFY",
+            ],
+        ),
+        "Gross Total Income": find_first_profile_value(
+            data,
+            [
+                "grossTotalIncome",
+                "gross_total_income",
+                "gti",
+                "GTI",
+            ],
+        ),
+        "Gross Total Income FY": find_first_profile_value(
+            data,
+            [
+                "grossTotalIncomeFY",
+                "grossTotalIncomeFy",
+                "grossTotalIncomeFinancialYear",
+                "gross_total_income_fy",
+                "gtiFinancialYear",
+                "gtiFY",
+            ],
+        ),
         "Nature of Business": nature_of_business,
         "Principal Place State": addr.get("stcd", ""),
         "Principal Place City": addr.get("loc", "") or addr.get("dst", ""),
@@ -540,6 +634,10 @@ def fetch_one_gstin(
         "Cancellation Date": "",
         "Last Updated on GSTN": "",
         "E-Invoice Status": "",
+        "Aggregate Turnover": "",
+        "Aggregate Turnover FY": "",
+        "Gross Total Income": "",
+        "Gross Total Income FY": "",
         "Nature of Business": "",
         "Principal Place State": "",
         "Principal Place City": "",
@@ -963,15 +1061,81 @@ st.set_page_config(
     page_title="Bulk GSTIN API + GSTR Reports",
     page_icon="🧾",
     layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-st.title("🧾 Bulk GSTIN API Lookup + GSTR-1 / GSTR-3B Data")
-st.caption("Public filing status remains unchanged. New taxpayer-auth module can pull GSTR-1/GSTR-3B data after OTP authorization.")
+st.markdown(
+    """
+    <style>
+    .block-container {
+        padding-top: 1.4rem;
+        padding-bottom: 2rem;
+    }
+    .app-hero {
+        padding: 1.4rem 1.6rem;
+        border-radius: 22px;
+        background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 48%, #0f766e 100%);
+        color: white;
+        box-shadow: 0 12px 32px rgba(15, 23, 42, 0.18);
+        margin-bottom: 1rem;
+    }
+    .app-hero h1 {
+        margin: 0;
+        font-size: 2.05rem;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+    }
+    .app-hero p {
+        margin: 0.45rem 0 0 0;
+        opacity: 0.92;
+        font-size: 1rem;
+    }
+    .soft-card {
+        padding: 1rem 1.1rem;
+        border-radius: 18px;
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        background: rgba(248, 250, 252, 0.85);
+        box-shadow: 0 10px 26px rgba(15, 23, 42, 0.05);
+        margin-bottom: 0.9rem;
+    }
+    .small-note {
+        color: #475569;
+        font-size: 0.92rem;
+    }
+    div[data-testid="stMetric"] {
+        background: rgba(248, 250, 252, 0.92);
+        border: 1px solid rgba(148, 163, 184, 0.25);
+        padding: 0.8rem 1rem;
+        border-radius: 18px;
+        box-shadow: 0 8px 22px rgba(15, 23, 42, 0.04);
+    }
+    div[data-testid="stTabs"] button {
+        font-weight: 650;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+st.markdown(
+    """
+    <div class="app-hero">
+        <h1>🧾 Bulk GSTIN API Lookup + GSTR Reports</h1>
+        <p>Clean dashboard for public GSTIN profile, filing table, turnover fields, e‑invoice status, and OTP-authorized GSTR‑1 / GSTR‑3B data.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.expander("Important: what credentials are needed?", expanded=True):
     st.markdown(
         """
-        **Public data already working:** only Sandbox API Key + API Secret are needed.
+        **Public data already working:** only Sandbox API Key + API Secret are needed. The app now also attempts to capture turnover-related profile fields when the API returns them:
+        - Aggregate Turnover
+        - Aggregate Turnover FY
+        - Gross Total Income
+        - Gross Total Income FY
+        - E-Invoice Status
 
         **GSTR-1 / GSTR-3B detailed data:** requires taxpayer OTP authorization for that GSTIN. Do **not** collect GST portal password. Use:
         - Sandbox API Key + API Secret
@@ -1021,11 +1185,11 @@ with st.sidebar:
 
 tab_input, tab_run, tab_results, tab_auth, tab_reports = st.tabs(
     [
-        "1. Input GSTINs",
-        "2. Run Public API",
-        "3. Results & Export",
-        "4. Taxpayer OTP Auth",
-        "5. Pull GSTR-1 / GSTR-3B",
+        "① Input GSTINs",
+        "② Public API Run",
+        "③ Dashboard & Export",
+        "④ Taxpayer OTP Auth",
+        "⑤ GSTR-1 / GSTR-3B Pull",
     ]
 )
 
@@ -1170,15 +1334,32 @@ with tab_results:
     if customers.empty:
         st.info("No public results yet. Run the public API lookup first.")
     else:
-        m1, m2, m3, m4, m5 = st.columns(5)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
         m1.metric("GSTINs Processed", len(customers))
         m2.metric("Active GSTINs", int(customers["GSTIN / UIN Status"].str.contains("Active", case=False, na=False).sum()))
-        m3.metric("Public Filing Rows", len(filings))
-        m4.metric("Private Return Responses", len(return_responses))
-        m5.metric("Errors", len(errors))
+        m3.metric("Turnover Found", int(customers["Aggregate Turnover"].astype(str).str.strip().ne("").sum()) if "Aggregate Turnover" in customers.columns else 0)
+        m4.metric("Public Filing Rows", len(filings))
+        m5.metric("GSTR Responses", len(return_responses))
+        m6.metric("Errors", len(errors))
 
         st.write("### Taxpayer Details")
         st.dataframe(customers, use_container_width=True)
+
+        st.write("### Turnover, GTI & E-Invoice Summary")
+        turnover_cols = [
+            "GSTIN",
+            "Legal Name of Business",
+            "Trade Name",
+            "Aggregate Turnover",
+            "Aggregate Turnover FY",
+            "Gross Total Income",
+            "Gross Total Income FY",
+            "E-Invoice Status",
+            "Filing Frequency",
+            "GSTIN / UIN Status",
+        ]
+        existing_turnover_cols = [col for col in turnover_cols if col in customers.columns]
+        st.dataframe(customers[existing_turnover_cols], use_container_width=True)
 
         st.write("### Public Filing Table in Detail")
         st.dataframe(filings, use_container_width=True)
